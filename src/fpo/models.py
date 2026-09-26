@@ -176,8 +176,11 @@ def permutation_importance_table(model, X: pd.DataFrame, y: pd.Series, n_repeats
 def rank_ic(scores: pd.Series, fwd_ret: pd.Series) -> pd.Series:
     """Per-date Spearman correlation between score and realised next-month return."""
     df = pd.concat([scores.rename("s"), fwd_ret.rename("r")], axis=1, join="inner").dropna()
-    return df.groupby(level="date").apply(lambda g: g["s"].corr(g["r"], method="spearman")
-                                          if len(g) > 4 else np.nan).dropna()
+    def _ic(g):  # undefined when either side has no variation (e.g. a constant baseline score)
+        if len(g) <= 4 or g["s"].nunique() < 2 or g["r"].nunique() < 2:
+            return np.nan
+        return g["s"].corr(g["r"], method="spearman")
+    return df.groupby(level="date").apply(_ic).dropna()
 
 
 def feature_ic_table(feats: pd.DataFrame) -> pd.DataFrame:
