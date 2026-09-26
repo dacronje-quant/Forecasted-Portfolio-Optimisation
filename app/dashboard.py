@@ -69,15 +69,29 @@ def table(df: pd.DataFrame, **kw) -> None:
 
 
 def style_fig(fig: go.Figure, height: int = 420, yfmt: str | None = None, title: str | None = None) -> go.Figure:
+    has_legend = sum(1 for t in fig.data if t.showlegend is not False) > 1
+    top = 10 + (34 if title else 0) + (28 if has_legend else 0)
     fig.update_layout(
-        height=height, margin=dict(l=10, r=10, t=40 if title else 10, b=10), title=title,
-        hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        height=height, margin=dict(l=10, r=10, t=top, b=10),
+        title=dict(text=title, x=0, xanchor="left", y=1, yanchor="top", yref="container",
+                   pad=dict(t=8), font=dict(size=15)) if title else None,
+        hovermode="x unified", showlegend=has_legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, yref="paper", x=0, font=dict(size=12)),
     )
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(gridcolor="rgba(128,128,128,0.18)", zeroline=False)
     if yfmt:
         fig.update_yaxes(tickformat=yfmt)
     return fig
+
+
+def log_axis(fig: go.Figure, values) -> None:
+    """Log y-axis with a few clean 'x-times' labels instead of Plotly's crowded minor ticks."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v) & (v > 0)]
+    lo, hi = (v.min(), v.max()) if len(v) else (0.5, 2)
+    ticks = [t for t in (0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200) if lo / 1.3 <= t <= hi * 1.3]
+    fig.update_yaxes(type="log", tickvals=ticks, ticktext=[f"{t:g}×" for t in ticks], minor=dict(showgrid=False))
 
 
 def pct(x, d=1):
@@ -211,14 +225,15 @@ b = res.benchmarks[ref]
 
 s_sum = M.summary(r, b)
 b_sum = M.summary(b)
-k = st.columns(6)
+k = st.columns(3) + st.columns(3)
 k[0].metric("CAGR", pct(s_sum["CAGR"]), f"{(s_sum['CAGR'] - b_sum['CAGR']) * 100:+.1f} pp vs benchmark")
 k[1].metric("Sharpe", f"{s_sum['Sharpe']:.2f}", f"{s_sum['Sharpe'] - b_sum['Sharpe']:+.2f}")
-k[2].metric("Max drawdown", pct(s_sum["Max drawdown"]),
+k[2].metric("Max drawdown", pct(s_sum["Max drawdown"], 0),
             f"{(s_sum['Max drawdown'] - b_sum['Max drawdown']) * 100:+.1f} pp")
 k[3].metric("Volatility", pct(s_sum["Volatility"]),
             f"{(s_sum['Volatility'] - b_sum['Volatility']) * 100:+.1f} pp", delta_color="inverse")
-k[4].metric("Months beating benchmark", pct(s_sum["% months beating"], 0))
+k[4].metric("Months beating benchmark", pct(s_sum["% months beating"], 0),
+            help="Share of months in which the strategy's return was higher than the benchmark's.")
 test = M.excess_return_test(r, b)
 k[5].metric("P(outperform)", pct(test["p_outperform_bootstrap"], 0),
             help="Block-bootstrap probability that the strategy's cumulative return beats the benchmark.")
@@ -228,10 +243,10 @@ tabs = st.tabs(["📈 Performance", "🧪 Is it real?", "🧺 Holdings", "🛒 T
 
 # =========================================================================== Performance
 with tabs[0]:
-    c1, c2 = st.columns([3, 1])
-    shown = c2.multiselect("Show benchmarks", bench_names, default=[ref] + ([EW_UNIVERSE] if ref != EW_UNIVERSE else []))
+    c1, c2, c3 = st.columns([4, 1, 1], vertical_alignment="bottom")
+    shown = c1.multiselect("Compare with", bench_names, default=[ref] + ([EW_UNIVERSE] if ref != EW_UNIVERSE else []))
     log_scale = c2.toggle("Log scale", value=True)
-    show_gross = c2.toggle("Show before-cost line", value=False)
+    show_gross = c3.toggle("Before costs", value=False, help="Also show the strategy before trading costs.")
     eq = res.equity_curves()
     fig = go.Figure()
     for name in shown:
@@ -242,10 +257,10 @@ with tabs[0]:
                         line=dict(color=STRATEGY_COLOR, width=1.5, dash="dot"))
     fig.add_scatter(x=eq.index, y=eq["Strategy"], name="Strategy", line=dict(color=STRATEGY_COLOR, width=3))
     fig.update_traces(hovertemplate="%{y:.2f}×")
+    style_fig(fig, 460, title=f"Growth of 1 {res.base_currency} (net of costs)")
     if log_scale:
-        fig.update_yaxes(type="log")
-    with c1:
-        show(style_fig(fig, 460, title=f"Growth of 1 {res.base_currency} (net of costs)"))
+        log_axis(fig, eq[["Strategy"] + shown].values)
+    show(fig)
 
     dd = pd.DataFrame({"Strategy": M.drawdown(r), ref: M.drawdown(b)})
     fig = go.Figure()
@@ -296,10 +311,12 @@ with tabs[1]:
     for bn in bench_names:
         t = M.excess_return_test(r, res.benchmarks[bn])
         rows.append({"Benchmark": bn, "Excess CAGR": pct(M.cagr(r) - M.cagr(res.benchmarks[bn])),
-                     "Information ratio": f"{M.information_ratio(r, res.benchmarks[bn]):.2f}",
-                     "t-stat (monthly excess)": f"{t['t_stat']:.2f}", "one-sided p-value": f"{t['p_value']:.3f}",
-                     "P(outperform) bootstrap": pct(t["p_outperform_bootstrap"], 0)})
+                     "Info ratio": f"{M.information_ratio(r, res.benchmarks[bn]):.2f}",
+                     "t-stat": f"{t['t_stat']:.2f}", "p-value": f"{t['p_value']:.3f}",
+                     "P(outperform)": pct(t["p_outperform_bootstrap"], 0)})
     table(pd.DataFrame(rows).set_index("Benchmark"))
+    st.caption("t-stat and p-value test the average monthly excess return (one-sided). "
+               "P(outperform) is a block-bootstrap probability that cumulative return beats the benchmark.")
     psr = M.probabilistic_sharpe(r, M.sharpe(b))
     st.caption(f"Probabilistic Sharpe ratio: **{pct(psr, 0)}** probability that the strategy's true Sharpe exceeds "
                f"the benchmark's ({M.sharpe(b):.2f}), adjusting for track-record length, skew and fat tails. "
@@ -312,10 +329,12 @@ with tabs[1]:
     fig.add_histogram(x=rp["random_cagr"], nbinsx=40, marker_color="#86b6ef", name="Random portfolios",
                       marker_line=dict(color="white", width=1), hovertemplate="CAGR %{x:.1%}: %{y}<extra></extra>")
     fig.add_vline(x=rp["strategy_cagr"], line=dict(color=STRATEGY_COLOR, width=3),
-                  annotation_text=f"Strategy {rp['strategy_cagr']:.1%}", annotation_position="top")
+                  annotation_text=f"Strategy {rp['strategy_cagr']:.1%}", annotation_position="top right",
+                  annotation_yshift=-4)
     fig.update_xaxes(tickformat=".0%", title="CAGR (before costs)")
+    fig.update_layout(showlegend=False)
     with c1:
-        show(style_fig(fig, 320))
+        show(style_fig(fig, 320, title="Random 15-stock portfolios vs the strategy"))
     c2.metric("Percentile vs random (CAGR)", pct(rp["cagr_percentile"], 0))
     c2.metric("Percentile vs random (Sharpe)", pct(rp["sharpe_percentile"], 0))
     c2.caption(f"{len(rp['random_cagr'])} equal-weight portfolios of {cfg.n_holdings} random stocks, redrawn monthly. "
@@ -403,7 +422,7 @@ with tabs[3]:
                 "and the optimiser builds the portfolio with your settings.")
     c1, c2 = st.columns([1, 2])
     budget = c1.number_input(f"Amount to invest ({cfg.base_currency})", 1_000.0, 100_000_000.0, 50_000.0, 1_000.0)
-    want_imp = c1.toggle("Explain the model (feature importance)", value=False)
+    want_imp = c1.toggle("Feature importance", value=False, help="Explain which inputs drive the model (slower).")
     holdings_file = c2.file_uploader("Optional: your current holdings (CSV with columns ticker,shares)", type="csv")
     with st.spinner("Training on full history and building this month's portfolio..."):
         rec = get_recommendation(source, cfg_key(cfg), want_imp)
@@ -417,10 +436,14 @@ with tabs[3]:
     cash = budget - tb["invested"].sum()
 
     st.subheader(f"Portfolio for {rec.as_of:%B %Y}")
-    st.caption(f"Prices as of {rec.price_date:%Y-%m-%d}. Whole shares only; uninvested cash {cash:,.0f} {cur}.")
+    too_pricey = tb.index[tb["shares"] == 0]
+    note = (f" {', '.join(tb.loc[too_pricey, 'name'])}: one share costs more than its target amount, so it is "
+            "skipped and the money spread over the others. Raise the amount to include it.") if len(too_pricey) else ""
+    st.caption(f"Prices as of {rec.price_date:%Y-%m-%d}. Whole shares only; uninvested cash {cash:,.0f} {cur}.{note}")
     c1, c2 = st.columns([2, 1])
     view = pd.DataFrame({
-        "Name": tb["name"], "Country": tb["country"], "Weight": tb["weight"].map(lambda v: f"{v:.1%}"),
+        "Name": tb["name"], "Country": tb["country"], "Target": tb["weight"].map(lambda v: f"{v:.1%}"),
+        "Actual": (tb["invested"] / budget).map(lambda v: f"{v:.1%}"),
         "Price": [f"{p:,.2f} {c}" for p, c in zip(tb["price_local"], tb["currency"])],
         "Shares to buy": tb["shares"], f"Amount ({cur})": tb["invested"].map(lambda v: f"{v:,.0f}"),
         "12-1 momentum": tb["mom_12_1"].map(lambda v: pct(v, 0)), "Volatility": tb["vol_3m"].map(lambda v: pct(v, 0)),
@@ -478,7 +501,11 @@ with tabs[4]:
                            hovertemplate="%{y}<br>mean IC %{x:.3f}<br>t-stat %{customdata[0]:.2f}"
                                          "<br>positive %{customdata[1]:.0%} of months<extra></extra>"))
     show(style_fig(fig, 560, title="Mean rank IC per feature (blue = higher value → better future return)"))
-    table(fi.sort_values("mean_ic", key=np.abs, ascending=False).round(3))
+    ft = fi.sort_values("mean_ic", key=np.abs, ascending=False)
+    table(pd.DataFrame({"Feature": [FEATURE_DESCRIPTIONS.get(i, i) for i in ft.index],
+                        "Mean IC": ft["mean_ic"].map(lambda v: f"{v:+.3f}"),
+                        "t-stat": ft["t_stat"].map(lambda v: f"{v:.2f}"),
+                        "Positive months": ft["hit_rate"].map(lambda v: pct(v, 0))}), hide_index=True)
 
 # =========================================================================== Compare
 with tabs[5]:

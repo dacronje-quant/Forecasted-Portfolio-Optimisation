@@ -66,7 +66,7 @@ def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None
         cache_file = _cache_path(cache_dir, tickers, start)
         if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < max_age_hours * 3600:
             log.info("Loading prices from cache %s", cache_file)
-            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            return _read_cache(cache_file)
 
     try:
         import yfinance as yf
@@ -91,7 +91,14 @@ def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None
     close.columns = [str(c) for c in close.columns]
     if cache_file is not None:
         close.to_csv(cache_file)
+        return _read_cache(cache_file)  # same numbers whether the data came fresh or from cache
     return close
+
+
+def _read_cache(path: Path) -> pd.DataFrame:
+    # round_trip parsing: the default fast parser can be off in the last digit, which is enough
+    # to change later rankings and make fresh and cached runs disagree
+    return pd.read_csv(path, index_col=0, parse_dates=True, float_precision="round_trip")
 
 
 def clean_prices(prices: pd.DataFrame, spike: float = 0.40, revert_days: int = 5,

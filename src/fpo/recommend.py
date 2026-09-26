@@ -47,6 +47,16 @@ def allocate_whole_shares(weights: pd.Series, prices: pd.Series, budget: float,
         best = (gap[ok] / budget).idxmax()
         shares[best] += 1
         cash -= px[best]
+    # Second pass: stocks too expensive to buy leave cash idle. Spread it over the other holdings
+    # (most under-weight relative to target first) while staying within the weight cap.
+    cap = (max_weight if max_weight is not None else 1.0) * budget * 1.001
+    for _ in range(10_000):
+        ok = (px <= cash + 1e-9) & ((shares + 1) * px <= cap) & (weights > 0)
+        if not ok.any():
+            break
+        fill = (shares * px / target.where(target > 0))[ok]
+        shares[fill.idxmin()] += 1
+        cash -= px[fill.idxmin()]
     return {k: int(v) for k, v in shares.items()}
 
 

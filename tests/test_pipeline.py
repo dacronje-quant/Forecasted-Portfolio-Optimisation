@@ -171,5 +171,6 @@ def test_whole_share_allocation():
     spent = sum(sh[k] * px[k] for k in sh)
     assert spent <= 1000
     assert sh["C"] == 0  # 700 per share vs a 200 target: buying one would overshoot badly
-    for k in sh:  # every holding lands within one share of its target amount
-        assert abs(sh[k] * px[k] - w[k] * 1000) <= px[k]
+    assert 1000 - spent < px[["A", "B"]].min()  # idle cash is spread over the affordable holdings
+    capped = allocate_whole_shares(w, px, 1000, max_weight=0.5)
+    assert all(capped[k] * px[k] <= 0.5 * 1000 * 1.001 for k in capped)
