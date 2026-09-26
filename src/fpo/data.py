@@ -1,0 +1,209 @@
+"""Market data: download from Yahoo Finance (with on-disk cache) or simulate.
+
+All prices are dividend/split adjusted closes. Everything the backtester sees is
+converted into a single base currency (SEK by default) using USDSEK, so a
+Swedish investor's currency exposure is part of the measured returns.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from fpo.universe import (
+    BENCHMARKS, FX_TICKER, all_names, get_universe, ticker_country, ticker_currency,
+)
+
+log = logging.getLogger(__name__)
+
+DEFAULT_CACHE_DIR = Path("data_cache")
+
+
+@dataclass
+class MarketData:
+    prices: pd.DataFrame          # daily adjusted close, base currency, columns = stocks
+    local_prices: pd.DataFrame    # daily adjusted close, trading currency
+    benchmarks: pd.DataFrame      # daily benchmark levels, base currency
+    fx: pd.Series                 # SEK per USD
+    base_currency: str = "SEK"
+    names: dict[str, str] = field(default_factory=dict)
+    source: str = "yahoo"
+
+    @property
+    def tickers(self) -> list[str]:
+        return list(self.prices.columns)
+
+    def country(self, ticker: str) -> str:
+        return ticker_country(ticker)
+
+    def currency(self, ticker: str) -> str:
+        return ticker_currency(ticker)
+
+
+# --------------------------------------------------------------------------- #
+# Yahoo Finance
+# --------------------------------------------------------------------------- #
+def _cache_path(cache_dir: Path, tickers: list[str], start: str) -> Path:
+    key = hashlib.md5((",".join(sorted(tickers)) + start).encode()).hexdigest()[:12]
+    return cache_dir / f"prices_{key}.pkl"
+
+
+def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None = DEFAULT_CACHE_DIR,
+                    max_age_hours: float = 20.0) -> pd.DataFrame:
+    """Download daily adjusted closes for `tickers` (local currency). Cached on disk."""
+    cache_file = None
+    if cache_dir is not None:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = _cache_path(cache_dir, tickers, start)
+        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < max_age_hours * 3600:
+            log.info("Loading prices from cache %s", cache_file)
+            return pd.read_pickle(cache_file)
+
+    try:
+        import yfinance as yf
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("yfinance is required for live data: pip install yfinance") from e
+
+    log.info("Downloading %d tickers from Yahoo Finance...", len(tickers))
+    raw = yf.download(tickers, start=start, auto_adjust=True, progress=False,
+                      group_by="column", threads=True)
+    if raw is None or raw.empty:
+        raise RuntimeError("Yahoo Finance returned no data (network blocked or rate limited?)")
+    if isinstance(raw.columns, pd.MultiIndex):
+        close = raw["Close"]
+    else:  # single ticker
+        close = raw[["Close"]].rename(columns={"Close": tickers[0]})
+    close = close.dropna(how="all", axis=1).sort_index()
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+    missing = sorted(set(tickers) - set(close.columns))
+    if missing:
+        log.warning("No data for: %s", ", ".join(missing))
+    if cache_file is not None:
+        close.to_pickle(cache_file)
+    return close
+
+
+def _to_base(local: pd.DataFrame, fx: pd.Series, base_currency: str) -> pd.DataFrame:
+    """Convert local-currency prices to the base currency. fx = SEK per USD."""
+    out = local.copy()
+    for t in out.columns:
+        cur = ticker_currency(t)
+        if cur == base_currency:
+            continue
+        if cur == "USD" and base_currency == "SEK":
+            out[t] = out[t] * fx
+        elif cur == "SEK" and base_currency == "USD":
+            out[t] = out[t] / fx
+    return out
+
+
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    # Different exchange holidays: forward-fill short gaps only (never before the first price
+    # and not across long suspensions / delistings).
+    return df.ffill(limit=5)
+
+
+def load_market_data(markets: str = "both", start: str = "2005-01-01", base_currency: str = "SEK",
+                     cache_dir: Path | str | None = DEFAULT_CACHE_DIR,
+                     extra_tickers: list[str] | None = None) -> MarketData:
+    """Download universe + benchmarks + FX from Yahoo and convert to base currency."""
+    stocks = list(get_universe(markets))
+    if extra_tickers:
+        stocks += [t for t in extra_tickers if t not in stocks]
+    everything = stocks + list(BENCHMARKS) + [FX_TICKER]
+    raw = download_prices(everything, start, cache_dir)
+
+    if FX_TICKER not in raw.columns:
+        raise RuntimeError("Could not download USDSEK exchange rate")
+    # Business-day calendar (union of US + SE trading days)
+    idx = raw.index[raw.index.dayofweek < 5]
+    raw = raw.loc[idx]
+    fx = raw[FX_TICKER].ffill().bfill()
+
+    local = _clean(raw[[t for t in stocks if t in raw.columns]])
+    bench_local = _clean(raw[[t for t in BENCHMARKS if t in raw.columns]])
+    prices = _to_base(local, fx, base_currency)
+    bench = _to_base(bench_local, fx, base_currency)
+    return MarketData(prices=prices, local_prices=local, benchmarks=bench, fx=fx,
+                      base_currency=base_currency, names=all_names(), source="yahoo")
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic data (offline demo / tests)
+# --------------------------------------------------------------------------- #
+def synthetic_market_data(markets: str = "both", start: str = "2005-01-01", end: str = "2025-12-31",
+                          base_currency: str = "SEK", seed: int = 7,
+                          signal_strength: float = 1.0) -> MarketData:
+    """Simulate a realistic-ish market with a *known, weak* predictable component.
+
+    Each stock has a slowly-varying latent expected return (AR(1) at monthly
+    frequency). Momentum-type features can partially recover it, so a working
+    ML pipeline should find a small edge — and with signal_strength=0 it should
+    find none (a useful sanity check against look-ahead bias).
+    """
+    rng = np.random.default_rng(seed)
+    universe = get_universe(markets)
+    tickers = list(universe)
+    n = len(tickers)
+    dates = pd.bdate_range(start, end)
+    T = len(dates)
+    is_se = np.array([ticker_country(t) == "SE" for t in tickers])
+
+    # Factors (daily)
+    us_mkt = rng.normal(0.0004, 0.011, T)
+    se_mkt = 0.6 * us_mkt + rng.normal(0.0002, 0.009, T)
+    fx_ret = rng.normal(0.0, 0.006, T) - 0.25 * us_mkt   # SEK tends to weaken in risk-off
+    # Occasional crashes to create realistic drawdowns
+    for _ in range(4):
+        s = rng.integers(0, T - 60)
+        us_mkt[s:s + 40] -= 0.006
+        se_mkt[s:s + 40] -= 0.007
+
+    beta = rng.uniform(0.6, 1.4, n)
+    idio_vol = rng.uniform(0.012, 0.028, n)
+
+    # Latent monthly alpha, AR(1), switched daily at month boundaries
+    months = dates.to_period("M")
+    month_codes, month_idx = np.unique(months.asi8, return_inverse=True)
+    n_months = len(month_codes)
+    alpha_m = np.zeros((n_months, n))
+    a = rng.normal(0, 0.01, n)
+    for m in range(n_months):
+        a = 0.92 * a + rng.normal(0, 0.004, n)
+        alpha_m[m] = a
+    alpha_d = alpha_m[month_idx] / 21.0 * signal_strength
+
+    mkt = np.where(is_se[None, :], se_mkt[:, None], us_mkt[:, None])
+    rets = beta[None, :] * mkt + alpha_d + rng.normal(0, 1, (T, n)) * idio_vol[None, :]
+    rets = np.clip(rets, -0.5, 0.5)
+    local = pd.DataFrame(100 * np.exp(np.cumsum(np.log1p(rets), axis=0)), index=dates, columns=tickers)
+
+    # Some stocks list late, one gets delisted -> exercises missing-data handling
+    for t in rng.choice(tickers, size=max(1, n // 10), replace=False):
+        local.loc[: dates[rng.integers(200, T // 2)], t] = np.nan
+    dead = rng.choice(tickers)
+    local.loc[dates[int(T * 0.8)]:, dead] = np.nan
+
+    fx = pd.Series(7.0 * np.exp(np.cumsum(fx_ret)), index=dates, name=FX_TICKER)
+    bench_local = pd.DataFrame({
+        "SPY": 100 * np.exp(np.cumsum(np.log1p(us_mkt + 0.00005))),
+        "URTH": 100 * np.exp(np.cumsum(np.log1p(0.7 * us_mkt + 0.3 * se_mkt))),
+        "^OMX": 100 * np.exp(np.cumsum(np.log1p(se_mkt))),
+    }, index=dates)
+    prices = _to_base(local, fx, base_currency)
+    bench = _to_base(bench_local, fx, base_currency)
+    names = {**universe, **BENCHMARKS}
+    return MarketData(prices=prices, local_prices=local, benchmarks=bench, fx=fx,
+                      base_currency=base_currency, names=names, source="synthetic")
+
+
+def month_end_prices(daily: pd.DataFrame) -> pd.DataFrame:
+    """Last available price in each calendar month (indexed by month-end timestamp)."""
+    return daily.resample("ME").last()

@@ -1,4 +1,11 @@
-sync.ffs_db
 *.ffs_db
-*.ffs_db
-*.ffs_db
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+data_cache/
+outputs/
+.streamlit/secrets.toml
+.DS_Store
