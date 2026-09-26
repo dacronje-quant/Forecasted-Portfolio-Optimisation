@@ -16,6 +16,16 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+# Streamlit re-runs this script when it changes but keeps imported modules in memory.
+# Reload the fpo package (dependencies first) so code updates apply without a restart.
+import importlib  # noqa: E402
+
+import fpo  # noqa: E402
+
+for _mod in ["universe", "config", "data", "features", "models", "optimizer", "metrics", "backtest", "recommend"]:
+    _full = f"fpo.{_mod}"
+    importlib.reload(importlib.import_module(_full))
+
 from fpo import metrics as M  # noqa: E402
 from fpo.backtest import BLEND, EW_UNIVERSE, run_backtest  # noqa: E402
 from fpo.config import MODELS, OPTIMIZERS, BacktestConfig  # noqa: E402
