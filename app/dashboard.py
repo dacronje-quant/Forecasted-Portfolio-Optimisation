@@ -409,7 +409,8 @@ with tabs[3]:
         rec = get_recommendation(source, cfg_key(cfg), want_imp)
     cur = rec.base_currency
     tb = rec.table.copy()
-    sh = allocate_whole_shares(tb["weight"], tb[f"price_{cur}"], budget)
+    sh = allocate_whole_shares(tb["weight"], tb[f"price_{cur}"], budget,
+                               max_weight=max(cfg.max_weight, float(tb["weight"].max())))
     tb["shares"] = pd.Series(sh)
     tb["target"] = tb["weight"] * budget
     tb["invested"] = tb["shares"] * tb[f"price_{cur}"]

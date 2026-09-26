@@ -129,6 +129,13 @@ def test_recommendation(data, feats):
     assert rec.trades is not None and "AAPL" in rec.trades.index
 
 
+def test_whole_shares_respect_cap():
+    w = pd.Series({"A": 0.12, "B": 0.88})
+    px = pd.Series({"A": 11_749.0, "B": 100.0})
+    sh = allocate_whole_shares(w, px, 50_000, max_weight=0.12)
+    assert sh["A"] == 0  # one share would be 23.5% of the budget
+
+
 def test_clean_prices_spikes_and_splits():
     from fpo.data import clean_prices
     idx = pd.bdate_range("2020-01-01", periods=40)

@@ -28,7 +28,8 @@ class Recommendation:
     trades: pd.DataFrame | None = None
 
 
-def allocate_whole_shares(weights: pd.Series, prices: pd.Series, budget: float) -> dict[str, int]:
+def allocate_whole_shares(weights: pd.Series, prices: pd.Series, budget: float,
+                          max_weight: float | None = None) -> dict[str, int]:
     """Round target amounts down to whole shares, then greedily spend leftover cash on the
     holdings furthest below target, as long as each extra share brings the holding closer
     to its target (i.e. its shortfall is at least half a share) and fits in the budget."""
@@ -39,6 +40,8 @@ def allocate_whole_shares(weights: pd.Series, prices: pd.Series, budget: float) 
     for _ in range(10_000):
         gap = target - shares * px                    # shortfall vs target, in money
         ok = (px <= cash + 1e-9) & (gap >= 0.5 * px)
+        if max_weight is not None:  # never let rounding push a position over the weight cap
+            ok &= (shares + 1) * px <= max_weight * budget * 1.001
         if not ok.any():
             break
         best = (gap[ok] / budget).idxmax()
@@ -71,7 +74,7 @@ def recommend_portfolio(data: MarketData, cfg: BacktestConfig | None = None, bud
     local_px = data.local_prices.loc[:price_date].ffill().iloc[-1]
     base_px = data.prices.loc[:price_date].ffill().iloc[-1]
 
-    shares_map = allocate_whole_shares(w, base_px[w.index], budget)
+    shares_map = allocate_whole_shares(w, base_px[w.index], budget, max_weight=max(cfg.max_weight, float(w.max())))
     rows = []
     for t, wt in w.items():
         amount = budget * wt
