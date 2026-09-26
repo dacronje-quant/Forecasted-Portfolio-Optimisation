@@ -15,7 +15,7 @@ import pandas as pd
 from fpo import metrics as M
 from fpo.backtest import EW_UNIVERSE, run_backtest
 from fpo.config import MODELS, OPTIMIZERS, BacktestConfig
-from fpo.data import load_market_data, synthetic_market_data
+from fpo.data import load_market_data, month_end_prices, synthetic_market_data
 from fpo.recommend import recommend_portfolio
 
 
@@ -48,9 +48,25 @@ def _data(a, cfg):
     return load_market_data(cfg.markets, start=cfg.start, base_currency=cfg.base_currency)
 
 
+def _data_report(data, out: Path) -> None:
+    """Save data-cleaning corrections and show the largest monthly moves as a sanity check."""
+    out.mkdir(parents=True, exist_ok=True)
+    q = data.quality
+    if q is not None and len(q):
+        q.to_csv(out / "data_quality.csv", index=False)
+        print(f"\nData cleaning: {len(q)} corrections to Yahoo prices (saved to data_quality.csv)")
+        print(q.groupby("issue").size().to_string())
+    m = month_end_prices(data.prices).pct_change(fill_method=None).stack()
+    big = m.abs().sort_values(ascending=False).head(8).index
+    print("\nLargest single-stock monthly moves after cleaning (check these look real):")
+    for d, t in big:
+        print(f"  {t:12s} {d:%Y-%m}  {m[(d, t)]:+.0%}")
+
+
 def cmd_backtest(a) -> None:
     cfg = _config(a)
     data = _data(a, cfg)
+    _data_report(data, Path(a.out))
     res = run_backtest(data, cfg, progress=lambda p, msg: print(f"[{p:>4.0%}] {msg}"))
     pd.set_option("display.width", 200)
     table = M.comparison_table(res.returns, res.benchmarks, ref=EW_UNIVERSE)

@@ -34,6 +34,7 @@ class MarketData:
     base_currency: str = "SEK"
     names: dict[str, str] = field(default_factory=dict)
     source: str = "yahoo"
+    quality: pd.DataFrame | None = None   # data-cleaning corrections applied
 
     @property
     def tickers(self) -> list[str]:
@@ -51,7 +52,8 @@ class MarketData:
 # --------------------------------------------------------------------------- #
 def _cache_path(cache_dir: Path, tickers: list[str], start: str) -> Path:
     key = hashlib.md5((",".join(sorted(tickers)) + start).encode()).hexdigest()[:12]
-    return cache_dir / f"prices_{key}.pkl"
+    # CSV (not pickle) so the cache is portable across pandas/pyarrow versions and machines
+    return cache_dir / f"prices_{key}.csv.gz"
 
 
 def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None = DEFAULT_CACHE_DIR,
@@ -64,7 +66,7 @@ def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None
         cache_file = _cache_path(cache_dir, tickers, start)
         if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < max_age_hours * 3600:
             log.info("Loading prices from cache %s", cache_file)
-            return pd.read_pickle(cache_file)
+            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
 
     try:
         import yfinance as yf
@@ -85,9 +87,73 @@ def download_prices(tickers: list[str], start: str, cache_dir: Path | str | None
     missing = sorted(set(tickers) - set(close.columns))
     if missing:
         log.warning("No data for: %s", ", ".join(missing))
+    close = close.astype("float64")
+    close.columns = [str(c) for c in close.columns]
     if cache_file is not None:
-        close.to_pickle(cache_file)
+        close.to_csv(cache_file)
     return close
+
+
+def clean_prices(prices: pd.DataFrame, spike: float = 0.40, revert_days: int = 5,
+                 split_ratio: float = 3.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Repair common Yahoo Finance data errors in daily (local-currency) prices.
+
+    1. Non-positive prices -> removed.
+    2. Spikes: a jump of more than `spike` (in log terms, either direction) that reverts to
+       within 35% of the jump size within `revert_days` days is a bad print; those prices are removed.
+    3. Unadjusted splits: a one-day move of more than `split_ratio`x (or 1/x) that does not
+       revert is treated as a missing split adjustment; earlier prices are rescaled.
+
+    Returns (cleaned prices, report of every correction).
+    """
+    out = prices.copy()
+    report = []
+    thr = np.log1p(spike)
+    split_thr = np.log(split_ratio)
+    for col in out.columns:
+        s = out[col]
+        bad0 = s <= 0
+        if bad0.any():
+            report += [{"ticker": col, "date": d, "issue": "non-positive price", "move": np.nan}
+                       for d in s.index[bad0]]
+            s = s.mask(bad0)
+        v = s.dropna()
+        if len(v) < 3:
+            out[col] = s
+            continue
+        lp = np.log(v.values)
+        idx = v.index
+        keep = np.ones(len(lp), dtype=bool)
+        prev = 0  # index of the last good price
+        i = 1
+        while i < len(lp):
+            jump = lp[i] - lp[prev]
+            if abs(jump) > thr:
+                end = None
+                for j in range(i + 1, min(i + 1 + revert_days, len(lp))):
+                    if abs(lp[j] - lp[prev]) < 0.35 * abs(jump):
+                        end = j
+                        break
+                if end is not None:
+                    keep[i:end] = False
+                    report.append({"ticker": col, "date": idx[i], "issue": f"spike removed ({end - i} day(s))",
+                                   "move": float(np.expm1(jump))})
+                    prev, i = end, end + 1
+                    continue
+                if abs(jump) > split_thr:
+                    # snap to the nearest whole split ratio (e.g. 10:1) when close, so the day's
+                    # genuine price change is preserved; otherwise remove the whole jump
+                    k = round(float(np.exp(abs(jump))))
+                    adj = np.sign(jump) * np.log(k) if abs(np.exp(abs(jump)) / k - 1) < 0.08 else jump
+                    lp[:i] += adj  # rescale history so the level is continuous
+                    report.append({"ticker": col, "date": idx[i], "issue": "unadjusted split fixed",
+                                   "move": float(np.expm1(jump))})
+            prev = i
+            i += 1
+        clean = pd.Series(np.where(keep, np.exp(lp), np.nan), index=idx)
+        out[col] = clean.reindex(s.index)
+    rep = pd.DataFrame(report, columns=["ticker", "date", "issue", "move"])
+    return out, rep
 
 
 def _to_base(local: pd.DataFrame, fx: pd.Series, base_currency: str) -> pd.DataFrame:
@@ -125,6 +191,9 @@ def load_market_data(markets: str = "both", start: str = "2005-01-01", base_curr
     # Business-day calendar (union of US + SE trading days)
     idx = raw.index[raw.index.dayofweek < 5]
     raw = raw.loc[idx]
+    raw, quality = clean_prices(raw)
+    if len(quality):
+        log.warning("Data cleaning: %d corrections (see data_quality report)", len(quality))
     fx = raw[FX_TICKER].ffill().bfill()
 
     local = _clean(raw[[t for t in stocks if t in raw.columns]])
@@ -132,7 +201,7 @@ def load_market_data(markets: str = "both", start: str = "2005-01-01", base_curr
     prices = _to_base(local, fx, base_currency)
     bench = _to_base(bench_local, fx, base_currency)
     return MarketData(prices=prices, local_prices=local, benchmarks=bench, fx=fx,
-                      base_currency=base_currency, names=all_names(), source="yahoo")
+                      base_currency=base_currency, names=all_names(), source="yahoo", quality=quality)
 
 
 # --------------------------------------------------------------------------- #

@@ -521,3 +521,14 @@ with tabs[5]:
 # =========================================================================== Method
 with tabs[6]:
     st.markdown(Path(__file__).with_name("METHOD.md").read_text(encoding="utf-8"))
+    q = getattr(data, "quality", None)
+    with st.expander(f"Data quality: {0 if q is None else len(q)} corrections applied to Yahoo prices"):
+        if q is None or q.empty:
+            st.write("No corrections were needed.")
+        else:
+            st.caption("Bad prints (spikes that reverse within days) are removed; obviously unadjusted "
+                       "stock splits are fixed. Everything else is left as downloaded.")
+            qq = q.copy()
+            qq["name"] = [data.names.get(t, t) for t in qq["ticker"]]
+            qq["move"] = qq["move"].map(lambda v: pct(v, 0))
+            table(qq[["ticker", "name", "date", "issue", "move"]])

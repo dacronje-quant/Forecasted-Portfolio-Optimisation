@@ -129,6 +129,34 @@ def test_recommendation(data, feats):
     assert rec.trades is not None and "AAPL" in rec.trades.index
 
 
+def test_clean_prices_spikes_and_splits():
+    from fpo.data import clean_prices
+    idx = pd.bdate_range("2020-01-01", periods=40)
+    good = pd.Series(np.linspace(100, 110, 40), index=idx)
+    spiky = good.copy()
+    spiky.iloc[10] = 1000.0            # one-day bad print
+    spiky.iloc[20:22] = 5.0            # two-day bad print
+    split = good.copy()
+    split.iloc[:30] *= 10              # unadjusted 10:1 split
+    df = pd.DataFrame({"A": spiky, "B": split, "C": good})
+    out, rep = clean_prices(df)
+    assert out["A"].isna().sum() == 3
+    assert out["A"].dropna().pct_change().abs().max() < 0.05
+    assert np.allclose(out["B"], good, rtol=1e-9)
+    pd.testing.assert_series_equal(out["C"], good, check_names=False)
+    assert set(rep["ticker"]) == {"A", "B"}
+
+
+def test_real_crash_is_kept():
+    """A genuine one-way -60% move (no reversal) is not a split ratio and must be kept."""
+    from fpo.data import clean_prices
+    idx = pd.bdate_range("2020-01-01", periods=20)
+    s = pd.Series([100.0] * 10 + [40.0] * 10, index=idx)
+    out, rep = clean_prices(pd.DataFrame({"X": s}))
+    pd.testing.assert_series_equal(out["X"], s, check_names=False)
+    assert rep.empty
+
+
 def test_whole_share_allocation():
     w = pd.Series({"A": 0.5, "B": 0.3, "C": 0.2})
     px = pd.Series({"A": 90.0, "B": 45.0, "C": 700.0})
