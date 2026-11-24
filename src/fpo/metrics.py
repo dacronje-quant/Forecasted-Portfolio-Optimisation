@@ -7,6 +7,7 @@ import pandas as pd
 from scipy import stats
 
 PPY = 12  # periods per year
+EULER_GAMMA = 0.5772156649015329
 
 
 def cagr(r: pd.Series) -> float:
@@ -64,18 +65,42 @@ def information_ratio(r: pd.Series, b: pd.Series) -> float:
     return a.mean() / a.std() * np.sqrt(PPY) if a.std() > 0 else np.nan
 
 
-def probabilistic_sharpe(r: pd.Series, sr_benchmark: float = 0.0) -> float:
+def probabilistic_sharpe(r: pd.Series, sr_benchmark: float = 0.0, rf: float = 0.0) -> float:
     """P(true Sharpe > sr_benchmark) accounting for skew/kurtosis (Bailey & López de Prado)."""
-    r = r.dropna()
-    n = len(r)
-    if n < 12 or r.std() == 0:
+    ex = r.dropna() - rf / PPY
+    n = len(ex)
+    if n < 12 or ex.std() == 0:
         return np.nan
-    sr = r.mean() / r.std()                 # per-period
+    sr = ex.mean() / ex.std()                 # per-period
     sr_b = sr_benchmark / np.sqrt(PPY)
-    g3 = stats.skew(r)
-    g4 = stats.kurtosis(r, fisher=False)
+    g3 = stats.skew(ex)
+    g4 = stats.kurtosis(ex, fisher=False)
     denom = np.sqrt(max(1e-12, 1 - g3 * sr + (g4 - 1) / 4 * sr ** 2))
     return float(stats.norm.cdf((sr - sr_b) * np.sqrt(n - 1) / denom))
+
+
+def deflated_sharpe(r: pd.Series, n_trials: int = 1, sr_benchmark: float = 0.0,
+                    rf: float = 0.0) -> float:
+    """Deflated Sharpe Ratio (Bailey & López de Prado, 2014).
+
+    Adjusts the benchmark Sharpe hurdle upward for the expected maximum Sharpe
+    obtained by luck when selecting among `n_trials` candidate strategies.
+    Equals `probabilistic_sharpe` when `n_trials <= 1`.
+    """
+    ex = r.dropna() - rf / PPY
+    n = len(ex)
+    if n < 12 or ex.std() == 0:
+        return np.nan
+    if n_trials <= 1:
+        return probabilistic_sharpe(r, sr_benchmark=sr_benchmark, rf=rf)
+
+    # Expected maximum of N standard normals (extreme value theorem approximation)
+    z1 = stats.norm.ppf(1.0 - 1.0 / n_trials)
+    z2 = stats.norm.ppf(1.0 - 1.0 / (n_trials * np.e))
+    emax = (1.0 - EULER_GAMMA) * z1 + EULER_GAMMA * z2
+    sr_null_ann = emax / np.sqrt(max(1, n - 1)) * np.sqrt(PPY)
+    effective_bench = max(sr_benchmark, sr_null_ann)
+    return probabilistic_sharpe(r, sr_benchmark=effective_bench, rf=rf)
 
 
 def excess_return_test(r: pd.Series, b: pd.Series) -> dict:
@@ -98,10 +123,10 @@ def excess_return_test(r: pd.Series, b: pd.Series) -> dict:
             "p_outperform_bootstrap": wins / sims}
 
 
-def summary(r: pd.Series, bench: pd.Series | None = None) -> dict:
+def summary(r: pd.Series, bench: pd.Series | None = None, rf: float = 0.0) -> dict:
     out = {
-        "CAGR": cagr(r), "Volatility": ann_vol(r), "Sharpe": sharpe(r), "Sortino": sortino(r),
-        "Max drawdown": max_drawdown(r), "Calmar": calmar(r),
+        "CAGR": cagr(r), "Volatility": ann_vol(r), "Sharpe": sharpe(r, rf=rf),
+        "Sortino": sortino(r, rf=rf), "Max drawdown": max_drawdown(r), "Calmar": calmar(r),
         "Best month": r.max(), "Worst month": r.min(), "% positive months": (r > 0).mean(),
         "Total return": (1 + r.fillna(0)).prod() - 1,
     }
@@ -116,12 +141,44 @@ def summary(r: pd.Series, bench: pd.Series | None = None) -> dict:
     return out
 
 
-def comparison_table(strategy: pd.Series, benchmarks: pd.DataFrame, ref: str | None = None) -> pd.DataFrame:
-    cols = {"Strategy": summary(strategy, benchmarks[ref] if ref else None)}
+def comparison_table(strategy: pd.Series, benchmarks: pd.DataFrame,
+                     ref: str | None = None, rf: float = 0.0) -> pd.DataFrame:
+    cols = {"Strategy": summary(strategy, benchmarks[ref] if ref else None, rf=rf)}
     for c in benchmarks.columns:
         cols[c] = summary(benchmarks[c].reindex(strategy.index),
-                          benchmarks[ref] if ref and c != ref else None)
+                          benchmarks[ref] if ref and c != ref else None, rf=rf)
     return pd.DataFrame(cols)
+
+
+def subperiod_summary(r: pd.Series, bench: pd.Series | None = None,
+                      rf: float = 0.0, years_per_bucket: int = 3) -> pd.DataFrame:
+    """Break down CAGR, Sharpe, Max DD, and excess CAGR across non-overlapping multi-year periods."""
+    r = r.dropna()
+    if r.empty:
+        return pd.DataFrame()
+    min_y, max_y = int(r.index.year.min()), int(r.index.year.max())
+    rows = {}
+    y = min_y
+    while y <= max_y:
+        end_y = min(max_y, y + years_per_bucket - 1)
+        mask = (r.index.year >= y) & (r.index.year <= end_y)
+        sub_r = r[mask]
+        if len(sub_r) >= 6:
+            label = f"{y}–{end_y}" if end_y > y else str(y)
+            row = {
+                "Months": len(sub_r),
+                "CAGR": cagr(sub_r),
+                "Sharpe": sharpe(sub_r, rf=rf),
+                "Max drawdown": max_drawdown(sub_r),
+            }
+            if bench is not None:
+                sub_b = bench.reindex(sub_r.index).dropna()
+                if len(sub_b) >= 6:
+                    row["Bench CAGR"] = cagr(sub_b)
+                    row["Excess CAGR"] = cagr(sub_r) - cagr(sub_b)
+            rows[label] = row
+        y = end_y + 1
+    return pd.DataFrame(rows).T
 
 
 def rolling_excess(r: pd.Series, b: pd.Series, window: int = 12) -> pd.Series:
@@ -130,8 +187,9 @@ def rolling_excess(r: pd.Series, b: pd.Series, window: int = 12) -> pd.Series:
     return rr - bb
 
 
-def rolling_sharpe(r: pd.Series, window: int = 36) -> pd.Series:
-    return r.rolling(window).mean() / r.rolling(window).std() * np.sqrt(PPY)
+def rolling_sharpe(r: pd.Series, window: int = 36, rf: float = 0.0) -> pd.Series:
+    ex = r - rf / PPY
+    return ex.rolling(window).mean() / ex.rolling(window).std() * np.sqrt(PPY)
 
 
 def calendar_year_returns(df: pd.DataFrame) -> pd.DataFrame:

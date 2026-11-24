@@ -1,4 +1,4 @@
-"""Investable universe and benchmark definitions (Yahoo Finance tickers).
+"""Investable universe, sector metadata, and benchmark definitions (Yahoo Finance tickers).
 
 The universe is a hand-picked list of liquid large caps. NOTE: using today's
 list of large caps to backtest the past introduces *survivorship bias* (the
@@ -56,11 +56,67 @@ SE_STOCKS: dict[str, str] = {
     "SBB-B.ST": "SBB", "INDT.ST": "Indutrade", "SWEC-B.ST": "Sweco",
 }
 
+SECTORS: dict[str, str] = {
+    # US Technology
+    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Technology", "GOOGL": "Technology",
+    "META": "Technology", "AVGO": "Technology", "ORCL": "Technology", "CSCO": "Technology",
+    "ADBE": "Technology", "CRM": "Technology", "INTC": "Technology", "AMD": "Technology",
+    "QCOM": "Technology", "TXN": "Technology", "IBM": "Technology", "NFLX": "Technology",
+    # US Consumer
+    "AMZN": "Consumer", "TSLA": "Consumer", "PG": "Consumer", "KO": "Consumer",
+    "PEP": "Consumer", "WMT": "Consumer", "COST": "Consumer", "HD": "Consumer",
+    "LOW": "Consumer", "MCD": "Consumer", "NKE": "Consumer", "SBUX": "Consumer",
+    "TGT": "Consumer", "DIS": "Consumer",
+    # US Financials
+    "BRK-B": "Financials", "JPM": "Financials", "V": "Financials", "MA": "Financials",
+    "BAC": "Financials", "WFC": "Financials", "GS": "Financials", "MS": "Financials",
+    "C": "Financials", "AXP": "Financials",
+    # US Health Care
+    "JNJ": "Health Care", "UNH": "Health Care", "LLY": "Health Care", "MRK": "Health Care",
+    "ABBV": "Health Care", "PFE": "Health Care", "TMO": "Health Care", "ABT": "Health Care",
+    "AMGN": "Health Care", "GILD": "Health Care", "BMY": "Health Care", "DHR": "Health Care",
+    # US Industrials
+    "CAT": "Industrials", "DE": "Industrials", "HON": "Industrials", "GE": "Industrials",
+    "MMM": "Industrials", "BA": "Industrials", "LMT": "Industrials", "RTX": "Industrials",
+    "UPS": "Industrials", "UNP": "Industrials",
+    # US Energy / Materials / Utilities / Telecom
+    "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+    "LIN": "Materials",
+    "NEE": "Utilities", "DUK": "Utilities", "SO": "Utilities",
+    "T": "Telecom", "VZ": "Telecom",
+    # Swedish stocks
+    "ABB.ST": "Industrials", "ALFA.ST": "Industrials", "ASSA-B.ST": "Industrials",
+    "ATCO-A.ST": "Industrials", "EPI-A.ST": "Industrials", "LIFCO-B.ST": "Industrials",
+    "NIBE-B.ST": "Industrials", "SAAB-B.ST": "Industrials", "SAND.ST": "Industrials",
+    "SKA-B.ST": "Industrials", "SKF-B.ST": "Industrials", "VOLV-B.ST": "Industrials",
+    "TREL-B.ST": "Industrials", "HUSQ-B.ST": "Industrials", "ADDT-B.ST": "Industrials",
+    "BEIJ-B.ST": "Industrials", "SECU-B.ST": "Industrials", "INDT.ST": "Industrials",
+    "SWEC-B.ST": "Industrials",
+    "ERIC-B.ST": "Technology", "HEXA-B.ST": "Technology", "SINCH.ST": "Technology",
+    "AZN.ST": "Health Care", "GETI-B.ST": "Health Care",
+    "BOL.ST": "Materials", "SCA-B.ST": "Materials", "HOLM-B.ST": "Materials",
+    "ELUX-B.ST": "Consumer", "ESSITY-B.ST": "Consumer", "EVO.ST": "Consumer",
+    "HM-B.ST": "Consumer", "AXFO.ST": "Consumer",
+    "INVE-B.ST": "Financials", "KINV-B.ST": "Financials", "NDA-SE.ST": "Financials",
+    "SEB-A.ST": "Financials", "SHB-A.ST": "Financials", "SWED-A.ST": "Financials",
+    "INDU-C.ST": "Financials", "LATO-B.ST": "Financials",
+    "TEL2-B.ST": "Telecom", "TELIA.ST": "Telecom",
+    "CAST.ST": "Real Estate", "SAGA-B.ST": "Real Estate", "SBB-B.ST": "Real Estate",
+}
+
 # Benchmarks an index-fund investor could realistically hold.
 BENCHMARKS: dict[str, str] = {
     "SPY": "S&P 500 (SPY)",
     "URTH": "MSCI World (URTH)",
+    "XACT-OMXS30.ST": "OMXS30 Total Return (XACT)",
     "^OMX": "OMX Stockholm 30 (price index)",
+}
+
+# Investable low-cost core ETFs used as a fallback sleeve when model signal is weak.
+CORE_ETFS: dict[str, str] = {
+    "SPY": "S&P 500 (SPY)",
+    "URTH": "MSCI World (URTH)",
+    "XACT-OMXS30.ST": "XACT OMXS30 (total return SE)",
 }
 
 FX_TICKER = "USDSEK=X"  # SEK per 1 USD
@@ -77,6 +133,11 @@ def ticker_country(ticker: str) -> str:
     return "SE" if ticker_currency(ticker) == "SEK" else "US"
 
 
+def ticker_sector(ticker: str) -> str:
+    """Standardized sector label for risk concentration limits and sector-neutral ranking."""
+    return SECTORS.get(ticker, "Other")
+
+
 def get_universe(markets: str = "both") -> dict[str, str]:
     """Return {ticker: name} for 'us', 'se' or 'both'."""
     markets = markets.lower()
@@ -90,4 +151,4 @@ def get_universe(markets: str = "both") -> dict[str, str]:
 
 
 def all_names() -> dict[str, str]:
-    return {**US_STOCKS, **SE_STOCKS, **BENCHMARKS}
+    return {**US_STOCKS, **SE_STOCKS, **BENCHMARKS, **CORE_ETFS}

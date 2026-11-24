@@ -1,17 +1,13 @@
 # Forecasted Portfolio Optimisation
 
-Monthly machine-learning stock selection and portfolio optimisation for **US + Swedish equities**,
-with leak-free walk-forward backtesting against the index funds you could buy instead, and an
-interactive dashboard to explore the results.
+Actionable monthly machine-learning stock selection, **walk-forward optimal strategy blending**, and **Avanza / Nordnet cost-aware execution** for **US + Swedish equities**, with leak-free backtesting and an interactive dashboard.
 
 Every month it:
 
-1. scores ~115 large-cap stocks (≈70 US, ≈45 Swedish) with a machine-learning model trained only on the past;
-2. builds an optimised long-only portfolio (mean-variance, minimum variance, HRP, ...);
-3. tells you **exactly what to buy**: shares per stock for your budget, in SEK.
-
-The backtest asks: *would this have beaten an S&P 500, MSCI World or OMXS30 index fund, after trading
-costs and currency effects, and is the difference more than luck?*
+1. validates live Yahoo Finance OHLCV & USD/SEK FX data without incomplete-month corruption;
+2. evaluates diverse *(model × optimiser)* strategies strictly out-of-sample (adjusted for multiple testing via the **Deflated Sharpe Ratio**) to blend the **most optimal strategy** walk-forward;
+3. builds a long-only portfolio with single-stock, **country**, and **sector** caps, weekly Ledoit-Wolf covariance, dynamic OOS IC calibration, and L1 turnover penalties;
+4. generates a **cash-safe SELL → BUY order ticket** tailored for **Avanza / Nordnet** (courtage + minimum SEK fee + 25 bps FX fee), supporting both **Smart DCA** (deploying your monthly 10 000 SEK deposit first to minimise churn) and **Full Rebalance**.
 
 ## Quick start (Windows / macOS / Linux)
 
@@ -28,106 +24,81 @@ pip install -e .
 streamlit run app/dashboard.py
 ```
 
-The dashboard opens in your browser. The first run downloads ~20 years of prices from Yahoo Finance
-(cached for the day in `data_cache/`). Pick **Simulated demo** in the sidebar to try it offline.
+The dashboard opens directly on the **Monthly Action Plan** tab. Pick **Simulated demo** in the sidebar to try it offline.
 
-### Command line
+## Monthly Workflow (CLI)
 
 ```bash
-# Walk-forward backtest, prints metrics + significance tests, saves CSVs to outputs/
-fpo backtest --model ensemble --optimizer mean_variance --n-holdings 15
+# 1. One-time setup: create your persistent portfolio state file
+fpo init-portfolio --file my_portfolio.json --broker avanza_mini --cash 0
+# (or import existing holdings: --from-csv my_holdings.csv)
 
-# This month's portfolio for 50 000 SEK
-fpo recommend --budget 50000
+# 2. Every month: run the optimal strategy engine with your 10 000 SEK deposit
+fpo decide --portfolio my_portfolio.json --deposit 10000 --broker avanza_mini --mode smart_dca
 
-# ...and the trades needed from what you already own (CSV with columns ticker,shares)
-fpo recommend --budget 250000 --holdings my_holdings.csv
+# Add --apply after executing the trades at Avanza/Nordnet to update my_portfolio.json & trade log
+fpo decide --portfolio my_portfolio.json --deposit 10000 --broker avanza_mini --mode smart_dca --apply
+
+# Benchmark the walk-forward meta-strategy selector vs individual strategies & index funds
+fpo meta-backtest --broker avanza_mini
+
+# Run a single-strategy backtest
+fpo backtest --model ensemble --optimizer mean_variance --broker avanza_mini --n-holdings 15
 ```
 
-Run `fpo backtest --help` for every option (markets, currency, costs, weight caps, ...).
+`fpo decide` prints the **Strategy Health** light (`GREEN` / `YELLOW` / `RED`), top-line **Verdict** (`DEPLOY CASH ONLY` / `REBALANCE` / `HOLD`), ordered **SELL → BUY** ticket with exact SEK fees and plain-English reasons, and saves:
+- `outputs/decision_YYYY-MM.md` — full monthly Markdown brief
+- `outputs/orders_YYYY-MM.csv` — execution ticket CSV
+
+Broker presets: `avanza_mini`, `avanza_small`, `avanza_medium`, `nordnet_mini`, `nordnet_small`, `nordnet_normal`, or `custom`.
 
 ## The dashboard
 
 | Tab | What you get |
 |---|---|
-| **Performance** | Growth of 1 SEK vs benchmarks (log/linear), drawdowns, full metrics table, calendar-year and monthly heatmap |
-| **Is it real?** | t-test and bootstrap of excess returns, probabilistic Sharpe, percentile vs 500 random portfolios, monthly rank-IC, quintile spread, rolling excess return and Sharpe |
-| **Holdings** | Country allocation over time, most-held stocks, turnover and cost drag, portfolio at any past date with each stock's contribution |
-| **This month's portfolio** | Stocks, weights and whole-share quantities for your budget, CSV download, trade list from your current holdings, model explanation (feature importance) |
-| **Features** | Predictive power of each input on its own |
-| **Compare models** | Same settings, different models: does ML beat simple momentum? |
-| **Method** | How it works and its limitations |
+| **Monthly Action Plan** | Strategy Health badge, top-line verdict, Avanza/Nordnet fee estimates, Smart DCA (10 000 SEK default) or Full Rebalance, inline holdings editor + `portfolio.json` import/export, ordered SELL → BUY ticket, Markdown brief download, OOS feature importance |
+| **Optimal Strategy (Meta)** | Walk-forward candidate leaderboard with **Deflated Sharpe Ratio**, meta-strategy vs candidates equity curve, dynamic strategy weights over time, sub-period stability |
+| **Performance** | Growth of 1 SEK vs benchmarks (incl. total-return `XACT-OMXS30.ST`), drawdowns, full metrics table, calendar-year & monthly heatmap |
+| **Is it real?** | t-test & block-bootstrap, Probabilistic & Deflated Sharpe Ratio, 500 random portfolios, rank-IC, quintile spread, rolling excess & Sharpe |
+| **Holdings** | Country & sector allocation over time, most-held stocks, turnover and cost drag, historical portfolio snapshot |
+| **Features** | Univariate predictive power of every price, OHLCV, and sector/country-neutral feature |
+| **Method** | Full methodology, statistical safeguards, and known limitations |
 
-Everything in the sidebar (model, optimiser, number of stocks, weight caps, country cap, costs,
-currency, markets, backtest period) can be changed and re-run.
-
-## Method
-
-**Features** (from past prices only, converted to cross-sectional percentile ranks): momentum over
-1/3/6/12 months and 12-minus-1, 1-week reversal, 1/3/12-month and downside volatility, skewness,
-6-month max drawdown, distance to the 52-week high, trend vs the 200-day average, beta and idiosyncratic
-volatility vs the universe, share of positive months, and country.
-
-**Models** predict next month's cross-sectional return rank:
-`gbm` (histogram gradient boosting), `random_forest`, `ridge`, `mlp` (neural network, a nod to this repo's
-origins in the `nnfor` R package), `ensemble` (average of all four), and `momentum` (non-ML baseline).
-
-**Walk-forward training**: at each month-end *t*, the model is trained only on months whose outcome was
-known before *t* (expanding or rolling window, optional embargo), refit every *k* months.
-
-**Optimisers**: `mean_variance` (expected alpha = IC × volatility × score, per Grinold & Kahn, with a
-Ledoit-Wolf shrunk covariance), `min_variance`, `hrp` (hierarchical risk parity), `inverse_vol`, `score`,
-`equal`. All long-only, with max/min position size, an optional max country weight, and a hold buffer that
-keeps existing positions while they still rank well, to limit turnover.
-
-**Costs**: a per-trade cost (default 15 bps) plus an FX fee (default 10 bps) on foreign-currency trades,
-applied to actual turnover from the drifted portfolio. Returns are measured in SEK (or USD), so currency
-moves are included.
-
-**Benchmarks**: S&P 500 (SPY), MSCI World (URTH), OMXS30 (^OMX), a 50/50 SPY/OMXS30 blend, and an
-equal-weight portfolio of the same universe.
-
-### Validation
-
-`tests/test_pipeline.py` checks, among other things, that:
-
-- changing future prices never changes today's features (no look-ahead);
-- training dates are strictly before each prediction date;
-- on simulated data with **no** predictable signal, the model finds no edge (catches leakage);
-- on simulated data **with** a signal, the model finds it and beats the equal-weight universe;
-- every optimiser returns valid long-only weights within the caps.
+## Validation
 
 ```bash
-pytest
+pytest -v
 ```
 
-### Limitations: read before investing
-
-- **Survivorship bias.** The universe is *today's* large caps, so companies that collapsed are missing.
-  This flatters any strategy on this universe, so compare against the **equal-weight universe** and the
-  **random portfolios**, not only the index.
-- **^OMX is a price index** (no dividends, ≈3–4 %/yr), which understates an OMXS30 fund. SPY and URTH include dividends.
-- Yahoo Finance data can have errors. Taxes (ISK/KF), minimum brokerage fees and bid/ask on small orders are simplified.
-- Trying many settings and choosing the best one overfits. Prefer settings that hold up across models and periods.
-
-*Research tool, not investment advice.*
+Automated tests in [tests/test_pipeline.py](tests/test_pipeline.py) and [tests/test_actionable.py](tests/test_actionable.py) verify:
+- strict no-look-ahead across features, walk-forward training, and meta-strategy weighting;
+- incomplete-month protection (running on the 1st of a month never corrupts momentum or training labels);
+- simultaneous single-stock, country, and sector cap feasibility even under concentrated top scores;
+- smooth L1 turnover-penalized mean-variance & weekly covariance estimation;
+- Avanza/Nordnet fee calculation, cash-safe SELL-then-BUY sizing, Smart DCA cash deployment, and `portfolio.json` persistence;
+- Deflated Sharpe Ratio multiple-testing monotonicity and live data-hygiene alerts.
 
 ## Project layout
 
 ```
 src/fpo/
-  universe.py    US + Swedish tickers, benchmarks
-  data.py        Yahoo Finance download + cache, FX conversion, simulated market
-  features.py    feature engineering (no look-ahead)
-  models.py      ML models, walk-forward training, IC, feature importance
-  optimizer.py   holding selection + portfolio optimisers
-  backtest.py    monthly walk-forward backtest with costs, benchmarks, diagnostics
-  metrics.py     performance metrics and significance tests
-  recommend.py   this month's portfolio and whole-share allocation
-  cli.py         `fpo backtest` / `fpo recommend`
+  universe.py    US + Swedish tickers, sector map, total-return & index benchmarks
+  config.py      BacktestConfig & Avanza/Nordnet BrokerFeeSchedule presets
+  data.py        OHLCV Yahoo Finance download + cache, completed month-ends, hygiene validator
+  features.py    Trading-day lookback, OHLCV & sector/country-neutral features (no look-ahead)
+  models.py      ML models, exponential time-decay training, ensemble disagreement, OOS importance
+  optimizer.py   Feasible country/sector selection, weekly cov, L1 turnover MV, HRP, dynamic IC, regime overlay
+  backtest.py    Walk-forward monthly backtest with dynamic IC, broker fees, overlays, diagnostics
+  meta.py        Walk-forward optimal strategy selection/blending, DSR leaderboard, strategy health
+  portfolio.py   Persistent portfolio.json state, cash-safe Smart DCA / Full Rebalance execution engine
+  metrics.py     Performance metrics, Deflated Sharpe Ratio, sub-period stability, significance tests
+  recommend.py   Live recommendations, optimal monthly decision builder, Markdown brief renderer
+  cli.py         `fpo decide` / `fpo meta-backtest` / `fpo backtest` / `fpo recommend` / `fpo init-portfolio`
 app/dashboard.py Streamlit dashboard
-tests/           pytest suite
+tests/           pytest suite (pipeline + actionable decision tests)
 ```
+
+*Research and decision-support tool, not licensed investment advice.*
 
 ## License
 
