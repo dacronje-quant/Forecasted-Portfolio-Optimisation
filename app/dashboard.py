@@ -124,8 +124,26 @@ def get_meta_backtest(source: str, cfg_items: tuple, fast: bool, selection_mode:
     data = get_data(source, cfg.markets, cfg.base_currency, cfg.start)
     feats = get_features(source, cfg.markets, cfg.base_currency, cfg.start)
     cands = FAST_CANDIDATES if fast else DEFAULT_CANDIDATES
-    return run_meta_backtest(data, cfg, candidates=cands, features=feats,
-                             lookback_months=lookback_months, selection_mode=selection_mode)
+    return run_meta_backtest(
+        data, cfg, candidates=cands, features=feats,
+        lookback_months=lookback_months, selection_mode=selection_mode,
+        cache_dir=None if source == "synthetic" else DEFAULT_CACHE_DIR,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600, max_entries=12)
+def get_tactical_backtest(source: str, cfg_items: tuple, exec_mode: str, selection_mode: str, budget_base: float):
+    cfg = BacktestConfig(**dict(cfg_items))
+    etf_start = max(cfg.start, "2018-01-01")
+    etf_data = (
+        synthetic_etf_market_data(start=etf_start, base_currency=cfg.base_currency)
+        if source == "synthetic"
+        else load_etf_market_data(start=etf_start, base_currency=cfg.base_currency)
+    )
+    return run_tactical_backtest(
+        etf_data, cfg=cfg, execution_mode=exec_mode,
+        selection_mode=selection_mode, budget_base=budget_base,
+    )
 
 
 def cfg_key(cfg: BacktestConfig) -> tuple:
@@ -259,6 +277,7 @@ tabs = st.tabs([
     "🧺 Holdings",
     "🔬 Features",
     "ℹ️ Method",
+    "🌐 Funds & ETFs (Core)",
 ])
 
 # =========================================================================== Tab 0: Monthly Action Plan
@@ -701,3 +720,69 @@ with tabs[5]:
 # =========================================================================== Tab 6: Method
 with tabs[6]:
     st.markdown(Path(__file__).with_name("METHOD.md").read_text(encoding="utf-8"))
+
+# =========================================================================== Tab 7: Funds & ETFs (Tactical Core)
+with tabs[7]:
+    st.markdown(
+        "Multi-asset tactical allocation across **0%-courtage Swedish mutual fund proxies & PRIIPs UCITS ETFs** "
+        "(Global, US, Sweden, Nordics, EM, Small Cap, Gold, Global Bonds, and Short Cash). "
+        "Combines **Defensive Asset Allocation (DAA + HERC)**, **Causal Jump-Regime NCO**, and **All-Weather HERC**."
+    )
+    c1, c2, c3 = st.columns(3)
+    tac_budget = c1.number_input(f"Core Fund/ETF Budget ({cfg.base_currency})", 10_000.0, 50_000_000.0, 550_000.0, 10_000.0)
+    tac_exec = c2.selectbox("Execution cost model", ["mutual_fund", "etf"],
+                            format_func={"mutual_fund": "0%-fee Swedish Mutual Funds (Nordnet/Avanza)", "etf": "UCITS ETFs (Broker + FX fees)"}.get)
+    tac_sel = c3.selectbox("Tactical selection", ["blend", "winner"], key="tac_sel",
+                           format_func={"blend": "Walk-Forward Blend", "winner": "Winner-Take-All"}.get)
+
+    with st.spinner("Running multi-asset Fund/ETF walk-forward tactical engine..."):
+        tac = get_tactical_backtest(source, cfg_key(cfg), tac_exec, tac_sel, float(tac_budget))
+
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1.metric("Live Causal Regime", tac.live_regime)
+    rc2.metric("DAA Canary Alerts", f"{tac.live_canary_bad} / 3", help="Negative 13612W momentum count on Global/EM/Bonds")
+    tac_top = tac.leaderboard.loc["Tactical Meta (Funds/ETFs)"]
+    rc3.metric("Tactical Meta CAGR", pct(tac_top["CAGR"]), f"Sharpe {tac_top['Sharpe']:.2f}")
+    rc4.metric("Max Drawdown", pct(tac_top["Max drawdown"]), f"Cost {pct(tac_top['Annual cost'], 2)}/yr")
+
+    st.subheader(f"Target Core Fund / UCITS ETF Allocation ({tac_budget:,.0f} {cfg.base_currency})")
+    lt = tac.live_table.copy()
+    lt_view = pd.DataFrame({
+        "Nordnet / Avanza Fund Equivalent": lt["fund_proxy"],
+        "Asset Class": lt["asset_class"],
+        "Weight": lt["weight"].map(lambda v: f"{v:.1%}"),
+        f"Target ({cfg.base_currency})": lt[f"target_{cfg.base_currency}"].map(lambda v: f"{v:,.0f}"),
+        "13612W Mom": lt["mom_13612w"].map(lambda v: pct(v)),
+        "0% Fee Fund?": lt["zero_fee_fund"].map(lambda b: "Yes" if b else "ETF/ETC"),
+    }, index=lt.index)
+    table(lt_view)
+    st.download_button(
+        "⬇ Download Tactical Core Brief (.md)",
+        render_tactical_brief(tac, float(tac_budget)).encode("utf-8"),
+        f"tactical_{tac.live_as_of:%Y-%m}.md",
+        "text/markdown",
+    )
+
+    st.subheader("Walk-Forward Multi-Asset Leaderboard")
+    tlb = tac.leaderboard.copy()
+    tlb_fmt = tlb.copy().astype(object)
+    for col in ["CAGR", "Volatility", "Deflated Sharpe", "Max drawdown", "Turnover", "Annual cost", "Current weight"]:
+        if col in tlb_fmt:
+            tlb_fmt[col] = [pct(v) for v in tlb[col]]
+    for col in ["Sharpe", "Calmar"]:
+        if col in tlb_fmt:
+            tlb_fmt[col] = ["–" if pd.isna(v) else f"{v:.2f}" for v in tlb[col]]
+    table(tlb_fmt)
+
+    fig_t = go.Figure()
+    for i, bcol in enumerate(tac.benchmarks.columns):
+        eb = (1.0 + tac.benchmarks[bcol]).cumprod()
+        fig_t.add_scatter(x=eb.index, y=eb, name=bcol, line=dict(color=SERIES_COLORS[i % len(SERIES_COLORS)], width=1.4, dash="dash"))
+    for i, (sk, sres) in enumerate(tac.strategies.items()):
+        es = (1.0 + sres.returns).cumprod()
+        fig_t.add_scatter(x=es.index, y=es, name=sres.name, line=dict(color=SERIES_COLORS[(i + 3) % len(SERIES_COLORS)], width=1.8))
+    em = (1.0 + tac.meta_returns).cumprod()
+    fig_t.add_scatter(x=em.index, y=em, name="Tactical Meta (Funds/ETFs)", line=dict(color=STRATEGY_COLOR, width=3.2))
+    fig_t.update_yaxes(type="log")
+    show(style_fig(fig_t, 420, title=f"Multi-Asset Funds/ETFs Growth of 1 {cfg.base_currency} (net of costs & TER)"))
+

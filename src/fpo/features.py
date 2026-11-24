@@ -25,6 +25,7 @@ FEATURES = [
     "skew_3m", "max_dd_6m", "dist_52w_high", "trend_200d", "reversal_1w",
     "beta_12m", "idio_vol_12m", "pos_months_12m",
     "dollar_vol_trend", "amihud_3m", "is_se",
+    "resid_mom_12_1", "fip_12_1",
 ]
 
 FEATURE_DESCRIPTIONS = {
@@ -51,6 +52,8 @@ FEATURE_DESCRIPTIONS = {
     "dollar_vol_trend": "Dollar-volume trend (21d vs 126d liquidity flow)",
     "amihud_3m": "3-month Amihud illiquidity (|return| / dollar volume)",
     "is_se": "Swedish stock (1) vs US (0)",
+    "resid_mom_12_1": "Beta-neutral residual 12-1 momentum scaled by idiosyncratic vol (Blitz et al.)",
+    "fip_12_1": "Frog-in-the-Pan path smoothness of 12-1 momentum (Da, Gurun & Warachka)",
 }
 
 MIN_DAILY_OBS = 200
@@ -164,7 +167,13 @@ def build_features(prices: pd.DataFrame, rebalance_dates: pd.DatetimeIndex | Non
             beta = ((r - r.mean(axis=0)) * mkt_c[:, None]).sum(axis=0) / denom if denom > 0 else np.zeros(len(cols))
             resid = r - beta[None, :] * mkt[:, None]
             f["beta_12m"] = beta
-            f["idio_vol_12m"] = resid.std(axis=0) * ann
+            idio_vol = resid.std(axis=0) * ann
+            f["idio_vol_12m"] = idio_vol
+            # Idiosyncratic 12-1 momentum scaled by idiosyncratic volatility (Blitz et al.)
+            f["resid_mom_12_1"] = resid[:-21].sum(axis=0) / np.maximum(idio_vol, 1e-4)
+            # Frog-in-the-Pan path smoothness over 12-1 window (Da, Gurun & Warachka)
+            r_12_1 = r[:-21]
+            f["fip_12_1"] = np.sign(f["mom_12_1"]) * ((r_12_1 > 0).mean(axis=0) - (r_12_1 < 0).mean(axis=0))
 
             # 12 non-overlapping 21-day windows up to pos
             block_idx = np.arange(pos - 252, pos + 1, 21)

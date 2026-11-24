@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from fpo.config import BacktestConfig
-from fpo.data import DataWarning, MarketData, validate_market_data
+from fpo.data import DEFAULT_CACHE_DIR, DataWarning, MarketData, validate_market_data
 from fpo.features import FEATURES, build_live_features, cross_sectional_ranks
 from fpo.meta import (
     DEFAULT_CANDIDATES, MetaBacktestResult, StrategyCandidate, StrategyHealth,
@@ -17,6 +17,7 @@ from fpo.meta import (
 from fpo.models import EnsembleModel, fit_full_model, oos_permutation_importance
 from fpo.optimizer import (
     apply_caps, compute_regime_exposure, estimate_dynamic_ic, optimise_weights,
+    precompute_weekly_returns,
 )
 from fpo.portfolio import ExecutionPlan, Holding, PortfolioState, build_execution_plan
 from fpo.universe import ticker_country, ticker_currency, ticker_sector
@@ -219,15 +220,10 @@ def recommend_optimal_portfolio(
     use_meta: bool = True,
     compute_importance: bool = False,
     as_of: pd.Timestamp | None = None,
+    cache_dir=DEFAULT_CACHE_DIR,
     progress=None,
 ) -> MonthlyDecision:
-    """Produce a complete, actionable monthly portfolio decision.
-
-    When `use_meta=True` (default), uses walk-forward meta-strategy selection/blending
-    to choose the optimal combination of models & optimizers, calibrates dynamic IC,
-    evaluates strategy health (GREEN/YELLOW/RED), and builds a cash-safe Avanza/Nordnet
-    execution ticket incorporating `state` and `deposit_base`.
-    """
+    """Produce a complete, actionable monthly portfolio decision."""
     cfg = (cfg or BacktestConfig()).validate()
     if state is None:
         state = PortfolioState(broker_preset=cfg.broker_preset, base_currency=cfg.base_currency)
@@ -242,6 +238,7 @@ def recommend_optimal_portfolio(
     held = list(clean_h) if clean_h else None
     prev_w = _current_weights_from_holdings(clean_h, base_px)
     hist_rets = data.prices.pct_change(fill_method=None).loc[:live_date]
+    wk_rets = precompute_weekly_returns(hist_rets) if cfg.cov_freq == "weekly" else None
     X_now = cross_sectional_ranks(live_feats).xs(live_date, level="date")
     live_raw = live_feats.xs(live_date, level="date")
 
@@ -251,19 +248,30 @@ def recommend_optimal_portfolio(
             meta = run_meta_backtest(
                 data, cfg, candidates=candidates, features=hist_feats,
                 lookback_months=lookback_months, selection_mode=selection_mode,
-                progress=progress,
+                cache_dir=cache_dir, progress=progress,
             )
         sw = meta.current_strategy_weights
         active_cands = [c for c in meta.candidate_specs if float(sw.get(c.name, 0.0)) > 1e-4]
-        unique_models = list(dict.fromkeys(c.model for c in active_cands))
+        req_models = list(dict.fromkeys(c.model for c in active_cands))
+        need_ens = "ensemble" in req_models
+        base_models = [m for m in req_models if m != "ensemble"]
+        if need_ens:
+            for mem in EnsembleModel.MEMBER_NAMES:
+                if mem not in base_models:
+                    base_models.append(mem)
 
-        # Train each active model ONCE on all completed history strictly before live_date
         live_scores_by_model: dict[str, pd.Series] = {}
-        for m_name in unique_models:
+        for m_name in base_models:
             m_cfg = replace(cfg, model=m_name)
             model, _, _ = fit_full_model(hist_feats, m_cfg, live_date)
             pred = np.asarray(model.predict(X_now[FEATURES]), dtype=float)
             live_scores_by_model[m_name] = pd.Series(pred, index=X_now.index)
+        if need_ens:
+            z_members = [
+                (live_scores_by_model[m] - live_scores_by_model[m].mean()) / (live_scores_by_model[m].std() + 1e-12)
+                for m in EnsembleModel.MEMBER_NAMES
+            ]
+            live_scores_by_model["ensemble"] = sum(z_members) / float(len(z_members))
 
         blended_w = pd.Series(dtype=float)
         blended_z = pd.Series(0.0, index=X_now.index, dtype=float)
@@ -276,7 +284,8 @@ def recommend_optimal_portfolio(
             cand_ic = meta.candidates[c.name].ic
             eff_ic_c = estimate_dynamic_ic(cand_ic, prior=cfg.ic_prior, lookback=cfg.ic_lookback_months) if cfg.use_dynamic_ic else cfg.assumed_ic
             c_cfg = replace(cfg, model=c.model, optimizer=c.optimizer)
-            cw = optimise_weights(sc, hist_rets, c_cfg, current=held, prev_weights=prev_w, effective_ic=eff_ic_c)
+            cw = optimise_weights(sc, hist_rets, c_cfg, current=held, prev_weights=prev_w,
+                                  effective_ic=eff_ic_c, weekly_returns=wk_rets)
             blended_w = blended_w.add(cw * pw, fill_value=0.0)
 
         blended_w = blended_w[blended_w > 1e-6].sort_values(ascending=False)

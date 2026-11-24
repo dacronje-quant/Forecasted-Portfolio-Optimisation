@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 
-MODELS = ("ensemble", "gbm", "random_forest", "ridge", "mlp", "momentum")
-OPTIMIZERS = ("mean_variance", "min_variance", "hrp", "inverse_vol", "score", "equal")
+MODELS = ("ensemble", "lgbm_rank", "smooth_mom", "gbm", "random_forest", "ridge", "mlp", "momentum")
+OPTIMIZERS = ("mean_variance", "min_variance", "hrp", "herc", "nco", "inverse_vol", "score", "equal")
 REBALANCE_MODES = ("smart_dca", "full")
 
 

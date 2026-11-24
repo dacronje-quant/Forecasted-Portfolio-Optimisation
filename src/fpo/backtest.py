@@ -26,6 +26,7 @@ from fpo.features import build_features_from_data
 from fpo.models import feature_ic_table, rank_ic, walk_forward_predict
 from fpo.optimizer import (
     apply_caps, compute_regime_exposure, estimate_dynamic_ic, optimise_weights,
+    precompute_weekly_returns,
 )
 from fpo.universe import BENCHMARKS, ticker_currency
 
@@ -81,7 +82,6 @@ def _build_benchmarks(data: MarketData, feats: pd.DataFrame, score_dates: pd.Dat
     fr = feats["fwd_ret"]
     ew = fr[fr.index.get_level_values("date").isin(score_dates)].groupby(level="date").mean()
     bench[EW_UNIVERSE] = ew.reindex(score_dates).values
-    # Prefer total-return XACT OMXS30 over price-only ^OMX for the 50/50 blend when available
     se_col = "XACT-OMXS30.ST" if ("XACT-OMXS30.ST" in bm_fwd.columns and bm_fwd["XACT-OMXS30.ST"].notna().all()) else "^OMX"
     if "SPY" in bm_fwd.columns and se_col in bm_fwd.columns:
         bench[BLEND] = 0.5 * bm_fwd["SPY"].values + 0.5 * bm_fwd[se_col].values
@@ -92,6 +92,9 @@ def _build_benchmarks(data: MarketData, feats: pd.DataFrame, score_dates: pd.Dat
 def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
                  features: pd.DataFrame | None = None,
                  precomputed_scores: pd.Series | None = None,
+                 weekly_returns: pd.DataFrame | None = None,
+                 precomputed_feature_ic: pd.DataFrame | None = None,
+                 precomputed_random: pd.DataFrame | None = None,
                  progress=None) -> BacktestResult:
     cfg = (cfg or BacktestConfig()).validate()
     prices = data.prices
@@ -101,9 +104,11 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
     monthly = month_end_prices(prices, completed_only=True)
     fwd = _period_returns(monthly)
     daily_ret = prices.pct_change(fill_method=None)
+    wk_ret = weekly_returns if weekly_returns is not None else (
+        precompute_weekly_returns(daily_ret) if cfg.cov_freq == "weekly" else None
+    )
 
     feat_dates = feats.index.get_level_values("date").unique().sort_values()
-    # Strictly completed month ends that have a subsequent completed month end
     eval_dates = feat_dates[(feat_dates >= pd.Timestamp(cfg.backtest_start)) & (feat_dates < monthly.index[-1])]
     if len(eval_dates) < 3:
         raise ValueError("Backtest period too short; move backtest_start earlier or download more history")
@@ -116,7 +121,6 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
         scores, _ = walk_forward_predict(feats, cfg, eval_dates)
     score_dates = scores.index.get_level_values("date").unique().sort_values()
 
-    # Precompute per-date realised rank IC so we can query strictly past (< t) IC leak-free
     fr = feats["fwd_ret"]
     ic_full = rank_ic(scores, fr)
     ic_full.index = pd.DatetimeIndex(ic_full.index)
@@ -126,16 +130,16 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
     fee_sched = cfg.fee_schedule()
     weights_hist, gross, net, turn, costs, period_end = {}, [], [], [], [], []
     exposures, eff_ics = [], []
-    prev_w = pd.Series(dtype=float)  # drifted equity weights just before rebalance
-    prev_exp = 0.0                   # previous equity exposure
+    prev_w = pd.Series(dtype=float)
+    prev_exp = 0.0
     base = data.base_currency
     rf_monthly = cfg.rf_annual / 12.0
 
     for t in score_dates:
         s_t = scores.xs(t, level="date")
         hist = daily_ret.loc[:t]
+        wk_t = wk_ret.loc[:t] if wk_ret is not None else None
 
-        # Strictly past realised OOS IC (date s < t means s's forward return ended at or before t)
         past_ic = ic_full[ic_full.index < t]
         if cfg.use_dynamic_ic:
             eff_ic = estimate_dynamic_ic(past_ic, prior=cfg.ic_prior, lookback=cfg.ic_lookback_months)
@@ -148,9 +152,9 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
             current=list(prev_w[prev_w > 0].index) if len(prev_w) else None,
             prev_weights=prev_w if len(prev_w) else None,
             effective_ic=eff_ic,
+            weekly_returns=wk_t,
         )
 
-        # Core/defensive fallback when trailing OOS IC is weak (after enough history)
         if cfg.core_fallback and len(past_ic) >= 18 and eff_ic < 0.015 and len(w) > 1:
             conf = float(np.clip(eff_ic / 0.015, 0.0, 1.0))
             vol = hist[w.index].iloc[-cfg.cov_lookback_days:].std().fillna(0.02).values * np.sqrt(252.0)
@@ -162,11 +166,9 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
                 index=w.index,
             )
 
-        # Optional volatility-targeting + trend regime overlay
         exp_t = compute_regime_exposure(data.benchmarks, t, target_vol=cfg.target_vol) if cfg.regime_overlay else 1.0
         exposures.append(exp_t)
 
-        # Effective portfolio weights including exposure scaling for accurate turnover & costs
         w_eff = w * exp_t
         prev_eff = prev_w * prev_exp if len(prev_w) else pd.Series(dtype=float)
         all_t = w_eff.index.union(prev_eff.index)
@@ -205,8 +207,14 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
     quint = q.groupby([q.index.get_level_values("date"), "quintile"])["r"].mean().unstack()
     quint.columns = [f"Q{int(c)}" for c in quint.columns]
 
-    rand = _random_portfolios(fr, score_dates, cfg.n_holdings, cfg.n_random_portfolios, cfg.random_state)
-    rand.index = idx
+    if precomputed_random is not None and len(precomputed_random) == len(idx):
+        rand = precomputed_random.copy()
+        rand.index = idx
+    else:
+        rand = _random_portfolios(fr, score_dates, cfg.n_holdings, cfg.n_random_portfolios, cfg.random_state)
+        rand.index = idx
+
+    feat_ic = precomputed_feature_ic if precomputed_feature_ic is not None else feature_ic_table(feats)
 
     if progress:
         progress(1.0, "Done")
@@ -214,7 +222,7 @@ def run_backtest(data: MarketData, cfg: BacktestConfig | None = None,
         config=cfg, returns=returns, gross_returns=gross_returns, benchmarks=bench,
         weights=weights, turnover=pd.Series(turn, index=score_dates, name="turnover"),
         costs=pd.Series(costs, index=score_dates, name="cost"), scores=scores, ic=ic_full,
-        quantile_returns=quint, random_returns=rand, feature_ic=feature_ic_table(feats),
+        quantile_returns=quint, random_returns=rand, feature_ic=feat_ic,
         features=feats, names=data.names, base_currency=data.base_currency, source=data.source,
         exposure=pd.Series(exposures, index=score_dates, name="exposure"),
         effective_ic=pd.Series(eff_ics, index=score_dates, name="effective_ic"),

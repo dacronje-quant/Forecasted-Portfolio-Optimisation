@@ -1,8 +1,9 @@
 """Cross-sectional return forecasting models and leak-free walk-forward training.
 
-The models predict *which stocks will do relatively better next month* (a
-ranking problem), not the absolute market direction. Scores are later turned
-into portfolio weights by the optimiser.
+Includes classic baselines (momentum, ridge), fast modern cross-sectional
+Learning-to-Rank (LightGBM XENDCG), smooth residual momentum (Blitz et al. +
+Frog-in-the-Pan), gradient boosting, random forest, neural network, and a fast
+diverse ensemble.
 """
 
 from __future__ import annotations
@@ -37,9 +38,113 @@ def _time_decay_weights(dates: pd.DatetimeIndex, halflife_months: int) -> np.nda
     return np.asarray(w / np.mean(w), dtype=float)
 
 
+class MomentumModel:
+    """Non-ML baseline: classic 12-1 momentum. Useful to see what ML adds."""
+
+    def fit(self, X, y, sample_weight=None):
+        return self
+
+    def predict(self, X):
+        return np.asarray(X["mom_12_1"], dtype=float)
+
+
+class SmoothResidualMomentumModel:
+    """Modern low-turnover signal: beta-neutral residual 12-1 momentum + Frog-in-the-Pan
+    path smoothness + modest low-volatility tilt (Blitz et al.; Da, Gurun & Warachka)."""
+
+    def fit(self, X, y, sample_weight=None):
+        return self
+
+    def predict(self, X):
+        rm = np.asarray(X["resid_mom_12_1"], dtype=float)
+        m12 = np.asarray(X["mom_12_1"], dtype=float)
+        fip = np.asarray(X["fip_12_1"], dtype=float)
+        vol = np.asarray(X["vol_12m"], dtype=float)
+        return 0.45 * rm + 0.30 * m12 + 0.15 * fip - 0.10 * vol
+
+
+class LGBMRankModel:
+    """Cross-sectional listwise Learning-to-Rank (LightGBM XENDCG) grouped by rebalance date.
+
+    Directly optimises top-of-list ranking accuracy (NDCG) within each date's cross-section
+    rather than wasting model capacity on MSE across middle-ranked stocks.
+    """
+
+    def __init__(self, random_state: int = 42):
+        self.random_state = random_state
+        self._est = None
+
+    def fit(self, X: pd.DataFrame, y: np.ndarray, sample_weight: np.ndarray | None = None):
+        try:
+            import lightgbm as lgb
+        except ImportError:  # pragma: no cover - graceful fallback
+            self._est = HistGradientBoostingRegressor(
+                max_iter=120, learning_rate=0.04, max_depth=3, min_samples_leaf=150,
+                l2_regularization=1.0, early_stopping=False, random_state=self.random_state,
+            )
+            self._est.fit(X, y)
+            return self
+
+        y_arr = np.asarray(y, dtype=float)
+        if isinstance(X.index, pd.MultiIndex) and "date" in X.index.names:
+            dates = X.index.get_level_values("date")
+            # Ensure rows are grouped contiguously by date
+            order = np.argsort(dates.asi8, kind="mergesort")
+            X_ord = X.iloc[order]
+            y_ord = y_arr[order]
+            d_ord = dates[order]
+            _, counts = np.unique(d_ord.asi8, return_counts=True)
+            # Per-group decile relevance labels 0..9 (required non-negative integers for rank_xendcg)
+            rel = np.zeros(len(y_ord), dtype=int)
+            pos = 0
+            for c in counts:
+                sl = y_ord[pos: pos + c]
+                ranks = pd.Series(sl).rank(pct=True).values
+                rel[pos: pos + c] = np.clip(np.floor(ranks * 10.0), 0, 9).astype(int)
+                pos += c
+            # LightGBM takes per-row weights for ranking and averages them into per-query
+            # weights internally (Metadata::CalculateQueryWeights), preserving time-decay.
+            row_w = None
+            if sample_weight is not None:
+                row_w = np.asarray(sample_weight, dtype=float)[order]
+
+            est = lgb.LGBMRanker(
+                objective="rank_xendcg",
+                n_estimators=100,
+                learning_rate=0.04,
+                max_depth=3,
+                num_leaves=7,
+                min_child_samples=60,
+                subsample=0.75,
+                subsample_freq=1,
+                colsample_bytree=0.75,
+                reg_lambda=2.0,
+                n_jobs=2,
+                random_state=self.random_state,
+                verbose=-1,
+            )
+            est.fit(X_ord, rel, group=counts.tolist(), sample_weight=row_w)
+            self._est = est
+        else:
+            est = lgb.LGBMRegressor(
+                n_estimators=100, learning_rate=0.04, max_depth=3, num_leaves=7,
+                min_child_samples=60, reg_lambda=2.0, n_jobs=2,
+                random_state=self.random_state, verbose=-1,
+            )
+            est.fit(X, y_arr, sample_weight=sample_weight)
+            self._est = est
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.asarray(self._est.predict(X), dtype=float)
+
+
 def _fit_with_weights(est, X: pd.DataFrame, y: np.ndarray, sample_weight: np.ndarray | None = None,
                       seed: int = 42):
-    if sample_weight is not None and not isinstance(est, MomentumModel):
+    if sample_weight is not None and not isinstance(est, (MomentumModel, SmoothResidualMomentumModel)):
+        if isinstance(est, LGBMRankModel):
+            est.fit(X, y, sample_weight=sample_weight)
+            return est
         # HistGradientBoostingRegressor's native weighted quantile binner is ~20x slower in sklearn;
         # deterministic weighted resampling preserves exponential time-decay at full Cython speed
         # and also brings time-decay weighting to MLPRegressor.
@@ -58,27 +163,15 @@ def _fit_with_weights(est, X: pd.DataFrame, y: np.ndarray, sample_weight: np.nda
     return est
 
 
-class MomentumModel:
-    """Non-ML baseline: classic 12-1 momentum. Useful to see what ML adds."""
-
-    def fit(self, X, y, sample_weight=None):
-        return self
-
-    def predict(self, X):
-        return np.asarray(X["mom_12_1"], dtype=float)
-
-
 class EnsembleModel:
-    """Average of z-scored predictions from diverse learners (linear, trees, neural net)."""
+    """Fast, diverse ensemble combining linear (Ridge), listwise LTR (LightGBM XENDCG),
+    tree regression (GBM), and smooth residual momentum."""
+
+    MEMBER_NAMES = ("ridge", "lgbm_rank", "gbm", "smooth_mom")
 
     def __init__(self, random_state: int = 42):
         self.random_state = random_state
-        self.members = {
-            "ridge": make_model("ridge", random_state),
-            "gbm": make_model("gbm", random_state),
-            "random_forest": make_model("random_forest", random_state),
-            "mlp": make_model("mlp", random_state),
-        }
+        self.members = {name: make_model(name, random_state) for name in self.MEMBER_NAMES}
 
     def fit(self, X, y, sample_weight=None):
         for m in self.members.values():
@@ -101,16 +194,19 @@ class EnsembleModel:
 def make_model(name: str, random_state: int = 42):
     if name == "ridge":
         return Ridge(alpha=10.0)
+    if name == "lgbm_rank":
+        return LGBMRankModel(random_state=random_state)
+    if name == "smooth_mom":
+        return SmoothResidualMomentumModel()
     if name == "gbm":
         return HistGradientBoostingRegressor(
-            max_iter=150, learning_rate=0.04, max_depth=3, min_samples_leaf=200,
+            max_iter=120, learning_rate=0.04, max_depth=3, min_samples_leaf=200,
             l2_regularization=1.0, early_stopping=False, random_state=random_state)
     if name == "random_forest":
         return RandomForestRegressor(
             n_estimators=100, max_depth=5, min_samples_leaf=100, max_features=0.33,
             max_samples=0.5, n_jobs=-1, random_state=random_state)
     if name == "mlp":
-        # Avoid random internal validation splits across time (prevents chronological leakage)
         return MLPRegressor(
             hidden_layer_sizes=(16, 8), alpha=5e-2, learning_rate_init=1e-3, max_iter=120,
             early_stopping=False, random_state=random_state)
@@ -122,13 +218,7 @@ def make_model(name: str, random_state: int = 42):
 
 
 def training_dates(all_dates: pd.DatetimeIndex, t: pd.Timestamp, cfg: BacktestConfig) -> pd.DatetimeIndex:
-    """Feature dates whose labels are fully known at rebalance date t.
-
-    A label for feature date s is the return s -> next completed month end,
-    known only at the month end after s. So we can train on dates strictly
-    before t (minus an optional embargo). This is the key guard against
-    look-ahead bias.
-    """
+    """Feature dates whose labels are fully known at rebalance date t."""
     past = all_dates[all_dates < t]
     if cfg.embargo_months > 0:
         past = past[: max(0, len(past) - cfg.embargo_months)]
@@ -139,14 +229,20 @@ def training_dates(all_dates: pd.DatetimeIndex, t: pd.Timestamp, cfg: BacktestCo
 
 def walk_forward_predict(feats: pd.DataFrame, cfg: BacktestConfig,
                          rebalance_dates: pd.DatetimeIndex) -> tuple[pd.Series, dict]:
-    """Produce out-of-sample scores for every rebalance date.
-
-    Returns (scores indexed by (date, ticker), info dict with the last fitted model
-    and optional ensemble disagreement series).
-    """
+    """Produce out-of-sample scores for every rebalance date."""
     X_all = cross_sectional_ranks(feats)
     y_all = make_target(feats, cfg.target)
     all_dates = feats.index.get_level_values("date").unique().sort_values()
+
+    # Fast path for stateless factor signals (no refit loop needed)
+    if cfg.model in ("momentum", "smooth_mom"):
+        model = make_model(cfg.model, cfg.random_state)
+        sub_mask = X_all.index.get_level_values("date").isin(rebalance_dates)
+        X_sub = X_all[sub_mask][FEATURES]
+        if X_sub.empty:
+            raise ValueError("No predictions produced: not enough history before backtest_start")
+        pred = np.asarray(model.predict(X_sub), dtype=float)
+        return pd.Series(pred, index=X_sub.index, name="score").sort_index(), {"model": model, "n_fits": 0}
 
     scores = []
     uncertainties = []
@@ -159,7 +255,7 @@ def walk_forward_predict(feats: pd.DataFrame, cfg: BacktestConfig,
         need_fit = model is None or last_fit is None or (i - last_fit) >= cfg.retrain_every
         if need_fit:
             tdates = training_dates(all_dates, t, cfg)
-            if len(tdates) < cfg.min_train_months and cfg.model != "momentum":
+            if len(tdates) < cfg.min_train_months:
                 continue
             mask = X_all.index.get_level_values("date").isin(tdates)
             X_tr, y_tr = X_all[mask], y_all[mask]
@@ -170,7 +266,7 @@ def walk_forward_predict(feats: pd.DataFrame, cfg: BacktestConfig,
             model = make_model(cfg.model, cfg.random_state)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                _fit_with_weights(model, X_ok, y_ok, sw)
+                _fit_with_weights(model, X_ok, y_ok, sw, seed=cfg.random_state)
             last_fit = i
             fits += 1
         X_t = X_all.xs(t, level="date", drop_level=False)
@@ -205,7 +301,7 @@ def fit_full_model(feats: pd.DataFrame, cfg: BacktestConfig, as_of: pd.Timestamp
     model = make_model(cfg.model, cfg.random_state)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        _fit_with_weights(model, X_ok, y_ok.values, sw)
+        _fit_with_weights(model, X_ok, y_ok.values, sw, seed=cfg.random_state)
     return model, X_ok, y_ok
 
 
@@ -233,16 +329,11 @@ def permutation_importance_table(model, X: pd.DataFrame, y: pd.Series, n_repeats
 
 def oos_permutation_importance(feats: pd.DataFrame, cfg: BacktestConfig, val_months: int = 24,
                                n_repeats: int = 3, seed: int = 0) -> pd.Series:
-    """Out-of-sample permutation importance evaluated on the most recent `val_months` labelled dates.
-
-    Trains on strictly earlier dates and measures the Spearman rank-IC drop on the held-out
-    validation window, avoiding in-sample overfitting distortion.
-    """
+    """Out-of-sample permutation importance evaluated on the most recent `val_months` labelled dates."""
     X_all = cross_sectional_ranks(feats)
     y_all = make_target(feats, cfg.target)
     labelled_dates = y_all.dropna().index.get_level_values("date").unique().sort_values()
     if len(labelled_dates) < cfg.min_train_months + 6:
-        # Fall back to full-sample if history is too short for a clean holdout
         as_of = labelled_dates[-1] + pd.Timedelta(days=1)
         model, X_tr, y_tr = fit_full_model(feats, cfg, as_of)
         return permutation_importance_table(model, X_tr, y_tr, n_repeats=n_repeats, seed=seed)
@@ -262,7 +353,7 @@ def oos_permutation_importance(feats: pd.DataFrame, cfg: BacktestConfig, val_mon
     model = make_model(cfg.model, cfg.random_state)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        _fit_with_weights(model, X_tr, y_tr.values, sw)
+        _fit_with_weights(model, X_tr, y_tr.values, sw, seed=cfg.random_state)
     return permutation_importance_table(model, X_val, y_val, n_repeats=n_repeats, seed=seed)
 
 

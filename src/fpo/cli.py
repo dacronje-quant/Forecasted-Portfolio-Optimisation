@@ -18,12 +18,16 @@ import pandas as pd
 from fpo import metrics as M
 from fpo.backtest import EW_UNIVERSE, run_backtest
 from fpo.config import BROKER_PRESETS, MODELS, OPTIMIZERS, REBALANCE_MODES, BacktestConfig
-from fpo.data import load_market_data, synthetic_market_data
+from fpo.data import (
+    DEFAULT_CACHE_DIR, load_etf_market_data, load_market_data,
+    synthetic_etf_market_data, synthetic_market_data,
+)
 from fpo.meta import DEFAULT_CANDIDATES, FAST_CANDIDATES, run_meta_backtest
 from fpo.portfolio import (
     PortfolioState, apply_execution_plan, load_portfolio, portfolio_from_csv, save_portfolio,
 )
 from fpo.recommend import recommend_optimal_portfolio, recommend_portfolio, render_monthly_brief
+from fpo.tactical import render_tactical_brief, run_tactical_backtest
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -103,6 +107,7 @@ def cmd_meta_backtest(a) -> None:
     meta = run_meta_backtest(
         data, cfg, candidates=cands, lookback_months=a.lookback_months,
         selection_mode=a.selection_mode,
+        cache_dir=None if a.synthetic else DEFAULT_CACHE_DIR,
         progress=lambda p, msg: print(f"[{p:>4.0%}] {msg}"),
     )
     pd.set_option("display.width", 220)
@@ -120,12 +125,54 @@ def cmd_meta_backtest(a) -> None:
     print(f"\nSaved meta-backtest CSVs to {out.resolve()}")
 
 
+def cmd_tactical(a) -> None:
+    cfg = _config(a)
+    if a.synthetic:
+        etf_data = synthetic_etf_market_data(start=a.start, base_currency=cfg.base_currency)
+    else:
+        etf_data = load_etf_market_data(start=a.start, base_currency=cfg.base_currency)
+
+    tactical = run_tactical_backtest(
+        etf_data, cfg=cfg, backtest_start=a.backtest_start,
+        execution_mode=a.exec_mode, lookback_months=a.lookback_months,
+        selection_mode=a.selection_mode, budget_base=a.budget,
+    )
+    pd.set_option("display.width", 220)
+    print(f"\n=== Multi-Asset Fund & UCITS ETF Leaderboard ({cfg.base_currency}, mode={a.exec_mode}) ===")
+    print(tactical.leaderboard.round(3).to_string())
+    print(f"\nLive Regime: {tactical.live_regime} | DAA Canary Alerts: {tactical.live_canary_bad}/3 | As of {tactical.live_as_of:%Y-%m-%d}")
+    print(f"\nTarget Core Allocation ({a.budget:,.0f} {cfg.base_currency}):")
+    cols = ["fund_proxy", "asset_class", "weight", f"target_{cfg.base_currency}", "mom_13612w", "zero_fee_fund"]
+    print(tactical.live_table[cols].to_string(float_format=lambda x: f"{x:,.3f}"))
+
+    sat_brief = None
+    if a.with_satellite > 0:
+        stock_data = _data(a, cfg)
+        st = PortfolioState(broker_preset=cfg.broker_preset, base_currency=cfg.base_currency)
+        dec = recommend_optimal_portfolio(
+            stock_data, cfg, state=st, deposit_base=a.with_satellite,
+            candidates=FAST_CANDIDATES if a.fast else DEFAULT_CANDIDATES,
+            cache_dir=None if a.synthetic else DEFAULT_CACHE_DIR,
+        )
+        sat_brief = render_monthly_brief(dec)
+        print(f"\nActive Satellite Sleeve ({a.with_satellite:,.0f} {cfg.base_currency}): "
+              f"Verdict={dec.plan.verdict} | Buy={dec.plan.buy_notional:,.0f} {cfg.base_currency} | Fees={dec.plan.total_fees:,.0f}")
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    brief_path = out / f"tactical_{tactical.live_as_of:%Y-%m}.md"
+    alloc_path = out / f"tactical_allocation_{tactical.live_as_of:%Y-%m}.csv"
+    brief_path.write_text(render_tactical_brief(tactical, a.budget, satellite_brief=sat_brief), encoding="utf-8")
+    tactical.live_table.to_csv(alloc_path)
+    print(f"\nSaved tactical brief      -> {brief_path.resolve()}")
+    print(f"Saved tactical allocation -> {alloc_path.resolve()}")
+
+
 def cmd_decide(a) -> None:
     cfg = _config(a)
     state: PortfolioState
     if a.portfolio and Path(a.portfolio).exists():
         state = load_portfolio(a.portfolio)
-        # Allow CLI --broker to override portfolio.json when explicitly provided
         if a.broker != "avanza_mini" or state.broker_preset == "custom":
             state.broker_preset = a.broker
         else:
@@ -142,6 +189,7 @@ def cmd_decide(a) -> None:
         data, cfg, state=state, deposit_base=a.deposit,
         candidates=cands, selection_mode=a.selection_mode,
         lookback_months=a.lookback_months, use_meta=(a.strategy == "optimal"),
+        cache_dir=None if a.synthetic else DEFAULT_CACHE_DIR,
         progress=lambda p, msg: print(f"[{p:>4.0%}] {msg}"),
     )
 
@@ -256,6 +304,21 @@ def main(argv=None) -> None:
     d.add_argument("--fast", action="store_true", help="use faster 5-strategy candidate set")
     d.add_argument("--apply", action="store_true", help="record orders and update --portfolio file")
     d.set_defaults(func=cmd_decide)
+
+    # Multi-asset Funds & UCITS ETFs tactical command
+    t = sub.add_parser("tactical", help="multi-asset tactical allocation across Nordnet/Avanza funds & UCITS ETFs")
+    _add_common(t)
+    t.set_defaults(broker="nordnet_mini", start="2018-01-01")
+    t.add_argument("--budget", type=float, default=550_000.0, help="core fund/ETF budget (base currency)")
+    t.add_argument("--exec-mode", default="mutual_fund", choices=["mutual_fund", "etf"],
+                   help="mutual_fund (0% fee on Swedish fund proxies) or etf (broker+FX fees)")
+    t.add_argument("--selection-mode", default="blend", choices=["blend", "winner"])
+    t.add_argument("--lookback-months", type=int, default=24)
+    t.add_argument("--backtest-start", default=None)
+    t.add_argument("--with-satellite", type=float, default=0.0,
+                   help="optional active single-stock satellite budget (base currency) to combine")
+    t.add_argument("--fast", action="store_true")
+    t.set_defaults(func=cmd_tactical)
 
     # Walk-forward meta-strategy backtest
     m = sub.add_parser("meta-backtest", help="walk-forward backtest of optimal meta-strategy selection")

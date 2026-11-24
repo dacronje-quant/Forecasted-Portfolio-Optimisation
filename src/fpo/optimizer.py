@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.cluster.hierarchy import fcluster, leaves_list, linkage
 from scipy.optimize import minimize
 from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 
 from fpo.config import BacktestConfig
 from fpo.universe import ticker_country, ticker_currency, ticker_sector
+
+
+def precompute_weekly_returns(daily_returns: pd.DataFrame) -> pd.DataFrame:
+    """Resample daily returns to Friday-ending weekly compounded returns ONCE for fast backtesting."""
+    if daily_returns.empty:
+        return daily_returns
+    return (1.0 + daily_returns).resample("W-FRI").prod(min_count=1) - 1.0
 
 
 def _group_masks(tickers: list[str], fn) -> dict[str, np.ndarray]:
@@ -101,18 +108,22 @@ def select_holdings(scores: pd.Series, n: int, current: list[str] | None = None,
     return [t for t in order if t in chosen_set]
 
 
-def shrunk_covariance(returns: pd.DataFrame, freq: str = "weekly") -> pd.DataFrame:
+def shrunk_covariance(returns: pd.DataFrame, freq: str = "weekly",
+                      weekly_returns: pd.DataFrame | None = None) -> pd.DataFrame:
     """Annualised Ledoit-Wolf covariance matrix.
 
     Using weekly (5-day) compounded returns by default eliminates cross-timezone
-    close-time asynchronicity and holiday zero-fill correlation bias between US
-    and Swedish stocks.
+    close-time asynchronicity and holiday zero-fill correlation bias between US,
+    European, and Swedish assets. Pass `weekly_returns` (precomputed once) to avoid
+    redundant per-date resampling inside backtest loops.
     """
-    if freq == "weekly" and len(returns) >= 40:
-        # Compound daily returns within each Friday-ending week (preserve all-NaN weeks)
-        wk = (1.0 + returns).resample("W-FRI").prod(min_count=1) - 1.0
-        wk = wk.dropna(how="all")
-        if len(wk) >= 15:
+    if freq == "weekly":
+        wk = None
+        if weekly_returns is not None and len(weekly_returns) >= 15:
+            wk = weekly_returns.dropna(how="all")
+        elif len(returns) >= 40:
+            wk = ((1.0 + returns).resample("W-FRI").prod(min_count=1) - 1.0).dropna(how="all")
+        if wk is not None and len(wk) >= 15:
             r = wk.fillna(0.0).values
             cov = LedoitWolf().fit(r).covariance_ * 52.0
             return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
@@ -342,6 +353,132 @@ def hrp_weights(cov: pd.DataFrame) -> np.ndarray:
     return w / w.sum()
 
 
+def _cluster_labels(cov_arr: np.ndarray, max_clusters: int = 5) -> np.ndarray:
+    """Ward hierarchical clustering on correlation distance."""
+    n = cov_arr.shape[0]
+    if n <= 2:
+        return np.arange(1, n + 1)
+    sd = np.sqrt(np.maximum(np.diag(cov_arr), 1e-12))
+    corr = np.clip(cov_arr / np.outer(sd, sd), -1.0, 1.0)
+    dist = np.sqrt(np.clip((1.0 - corr) / 2.0, 0.0, None))
+    np.fill_diagonal(dist, 0.0)
+    Z = linkage(squareform(dist, checks=False), method="ward")
+    k = max(2, min(max_clusters, int(np.ceil(np.sqrt(n)))))
+    return fcluster(Z, t=k, criterion="maxclust")
+
+
+def herc_weights(cov: pd.DataFrame, returns: pd.DataFrame | None = None) -> np.ndarray:
+    """Hierarchical Equal Risk Contribution (Raffinot, 2018).
+
+    Uses Ward linkage clustering to avoid HRP's single-linkage chaining, computes
+    cluster downside-adjusted risk (CVaR/variance blend when returns are given),
+    and equalizes risk contribution across and within clusters.
+    """
+    c = cov.values
+    n = c.shape[0]
+    if n == 1:
+        return np.array([1.0])
+    if n == 2:
+        iv = 1.0 / np.sqrt(np.maximum(np.diag(c), 1e-12))
+        return iv / iv.sum()
+
+    labels = _cluster_labels(c, max_clusters=min(6, n))
+    unique_cl = np.unique(labels)
+    w = np.zeros(n, dtype=float)
+    cl_risks = {}
+    cl_intra = {}
+
+    r_vals = returns.fillna(0.0).values if returns is not None and len(returns) >= 20 else None
+    for cl in unique_cl:
+        idx = np.where(labels == cl)[0]
+        sub_c = c[np.ix_(idx, idx)]
+        # Intra-cluster inverse-variance weights (downside-tilted if returns available)
+        if r_vals is not None:
+            sub_r = r_vals[:, idx]
+            down = np.sqrt(np.mean(np.minimum(sub_r, 0.0) ** 2, axis=0)) * np.sqrt(252.0)
+            asset_risk = 0.5 * np.sqrt(np.maximum(np.diag(sub_c), 1e-12)) + 0.5 * np.maximum(down, 1e-4)
+        else:
+            asset_risk = np.sqrt(np.maximum(np.diag(sub_c), 1e-12))
+        iw = 1.0 / np.maximum(asset_risk, 1e-6)
+        iw /= iw.sum()
+        cl_intra[cl] = (idx, iw)
+        # Cluster volatility (equal risk contribution allocates inversely to cluster risk)
+        cl_vol = float(np.sqrt(max(float(iw @ sub_c @ iw), 1e-12)))
+        if r_vals is not None:
+            cl_ret = r_vals[:, idx] @ iw
+            q05 = np.quantile(cl_ret, 0.05)
+            tail = cl_ret[cl_ret <= q05]
+            cvar = abs(float(tail.mean())) * np.sqrt(252.0) if len(tail) > 0 else cl_vol
+            cl_risks[cl] = 0.5 * cl_vol + 0.5 * max(cvar, 1e-4)
+        else:
+            cl_risks[cl] = cl_vol
+
+    inv_cl = {cl: 1.0 / max(rk, 1e-6) for cl, rk in cl_risks.items()}
+    tot_inv = sum(inv_cl.values())
+    for cl in unique_cl:
+        idx, iw = cl_intra[cl]
+        w[idx] = (inv_cl[cl] / tot_inv) * iw
+    return w / w.sum()
+
+
+def _mini_mv(S: np.ndarray, mu: np.ndarray | None, lam: float) -> np.ndarray:
+    """Fast long-only convex MV / MinVar solver on a small sub-cluster."""
+    m = S.shape[0]
+    if m == 1:
+        return np.array([1.0])
+    # Regularize diagonal slightly for numerical conditioning
+    S_reg = S + np.eye(m) * 1e-6
+    x0 = np.full(m, 1.0 / m)
+    ones = np.ones(m)
+    cons = [{"type": "eq", "fun": lambda x: x.sum() - 1.0, "jac": lambda x: ones}]
+    if mu is None:
+        obj = lambda x: float(x @ S_reg @ x)
+        jac = lambda x: 2.0 * (S_reg @ x)
+    else:
+        obj = lambda x: float(-(mu @ x) + 0.5 * lam * (x @ S_reg @ x))
+        jac = lambda x: -mu + lam * (S_reg @ x)
+    res = minimize(obj, x0, jac=jac, method="SLSQP", bounds=[(0.0, 1.0)] * m,
+                   constraints=cons, options={"maxiter": 100, "ftol": 1e-8})
+    if res.success and np.all(np.isfinite(res.x)) and res.x.sum() > 0:
+        w = np.clip(res.x, 0.0, 1.0)
+        return w / w.sum()
+    iv = 1.0 / np.maximum(np.diag(S_reg), 1e-8)
+    return iv / iv.sum()
+
+
+def nco_weights(cov: pd.DataFrame, mu: np.ndarray | None = None,
+                risk_aversion: float = 5.0) -> np.ndarray:
+    """Nested Clustered Optimization (López de Prado, 2019).
+
+    Decouples intra-cluster and inter-cluster optimisation so alpha forecasts can
+    be used without Markowitz covariance-inversion blow-ups.
+    """
+    S = cov.values
+    n = S.shape[0]
+    if n == 1:
+        return np.array([1.0])
+    if n <= 3:
+        return _mini_mv(S, mu, risk_aversion)
+
+    labels = _cluster_labels(S, max_clusters=min(5, n))
+    unique_cl = np.unique(labels)
+    k = len(unique_cl)
+    W_intra = np.zeros((n, k), dtype=float)
+    for j, cl in enumerate(unique_cl):
+        idx = np.where(labels == cl)[0]
+        sub_S = S[np.ix_(idx, idx)]
+        sub_mu = mu[idx] if mu is not None else None
+        W_intra[idx, j] = _mini_mv(sub_S, sub_mu, risk_aversion)
+
+    # Reduced k x k cluster covariance and expected returns
+    S_red = W_intra.T @ S @ W_intra
+    mu_red = (W_intra.T @ mu) if mu is not None else None
+    w_inter = _mini_mv(S_red, mu_red, risk_aversion)
+    w = W_intra @ w_inter
+    w = np.clip(w, 0.0, None)
+    return w / w.sum() if w.sum() > 0 else np.full(n, 1.0 / n)
+
+
 def estimate_dynamic_ic(past_ic: pd.Series | list[float], prior: float = 0.03,
                         lookback: int = 36, prior_weight: float = 12.0) -> float:
     """Empirical-Bayes shrunk estimate of trailing out-of-sample rank-IC, clipped to [0, 0.12]."""
@@ -365,7 +502,6 @@ def compute_regime_exposure(bench_daily: pd.DataFrame, as_of: pd.Timestamp,
     sub = bench_daily.loc[:as_of].dropna(how="all")
     if len(sub) < 70:
         return 1.0
-    # Prefer broad global/US benchmark if present, else equal-weight available benchmarks
     if "URTH" in sub.columns and sub["URTH"].dropna().shape[0] >= 70:
         px = sub["URTH"].dropna()
     elif "SPY" in sub.columns and sub["SPY"].dropna().shape[0] >= 70:
@@ -391,13 +527,15 @@ def compute_regime_exposure(bench_daily: pd.DataFrame, as_of: pd.Timestamp,
 def optimise_weights(scores: pd.Series, daily_returns: pd.DataFrame, cfg: BacktestConfig,
                      current: list[str] | None = None,
                      prev_weights: pd.Series | None = None,
-                     effective_ic: float | None = None) -> pd.Series:
+                     effective_ic: float | None = None,
+                     weekly_returns: pd.DataFrame | None = None) -> pd.Series:
     """Choose holdings and weights for one rebalance date.
 
     scores: model score per eligible ticker (higher = better expected relative return).
     daily_returns: trailing daily returns (base currency) used for risk estimates.
     prev_weights: optional drifted portfolio weights just before rebalance (enables L1 turnover penalty).
     effective_ic: optional dynamically calibrated Grinold IC (overrides cfg.assumed_ic).
+    weekly_returns: optional precomputed weekly returns sliced up to rebalance date for fast covariance.
     """
     scores = scores.dropna()
     if scores.empty:
@@ -414,6 +552,7 @@ def optimise_weights(scores: pd.Series, daily_returns: pd.DataFrame, cfg: Backte
     )
     n = len(chosen)
     rets = daily_returns[chosen].iloc[-cfg.cov_lookback_days:]
+    wk_slice = weekly_returns[chosen].iloc[-max(16, cfg.cov_lookback_days // 5):] if weekly_returns is not None else None
     method = cfg.optimizer
 
     if method == "equal" or n == 1:
@@ -427,15 +566,25 @@ def optimise_weights(scores: pd.Series, daily_returns: pd.DataFrame, cfg: Backte
         w = apply_caps(1.0 / np.maximum(vol, 1e-4), chosen, cfg.max_weight,
                        cfg.max_country_weight, cfg.max_sector_weight)
     else:
-        cov = shrunk_covariance(rets, freq=cfg.cov_freq)
+        cov = shrunk_covariance(rets, freq=cfg.cov_freq, weekly_returns=wk_slice)
         S = cov.values
         if method == "min_variance":
             w = _solve(lambda x: float(x @ S @ x), n, chosen, cfg, jac=lambda x: 2.0 * (S @ x))
         elif method == "hrp":
             w = apply_caps(hrp_weights(cov), chosen, cfg.max_weight,
                            cfg.max_country_weight, cfg.max_sector_weight)
+        elif method == "herc":
+            w = apply_caps(herc_weights(cov, returns=rets), chosen, cfg.max_weight,
+                           cfg.max_country_weight, cfg.max_sector_weight)
+        elif method == "nco":
+            z_all = (scores - scores.mean()) / (scores.std() + 1e-12)
+            z = z_all[chosen].values
+            vol = np.sqrt(np.maximum(np.diag(S), 1e-12))
+            ic_val = cfg.assumed_ic if effective_ic is None else float(effective_ic)
+            mu = ic_val * vol * z
+            w = apply_caps(nco_weights(cov, mu=mu, risk_aversion=cfg.risk_aversion), chosen,
+                           cfg.max_weight, cfg.max_country_weight, cfg.max_sector_weight)
         elif method == "mean_variance":
-            # Grinold & Kahn: expected active return = IC * volatility * score z-score.
             z_all = (scores - scores.mean()) / (scores.std() + 1e-12)
             z = z_all[chosen].values
             vol = np.sqrt(np.maximum(np.diag(S), 1e-12))
@@ -444,7 +593,6 @@ def optimise_weights(scores: pd.Series, daily_returns: pd.DataFrame, cfg: Backte
             lam = cfg.risk_aversion
             if prev_weights is not None and len(prev_weights) > 0 and cfg.turnover_penalty > 0:
                 w_prev = prev_weights.reindex(chosen, fill_value=0.0).values.astype(float)
-                # Penalize foreign-currency churn 1.5x more to reflect FX spread drag
                 tc = np.array([
                     cfg.turnover_penalty * (1.5 if ticker_currency(t) != cfg.base_currency else 1.0)
                     for t in chosen
@@ -459,7 +607,6 @@ def optimise_weights(scores: pd.Series, daily_returns: pd.DataFrame, cfg: Backte
     out = pd.Series(w, index=chosen)
     out = out[out > 1e-6]
     out = out / out.sum()
-    # Drop positions too small to be worth buying, then re-apply caps on what's left
     if cfg.min_weight > 0 and (out < cfg.min_weight).any() and (out >= cfg.min_weight).sum() >= 1:
         out = out[out >= cfg.min_weight]
         out = pd.Series(

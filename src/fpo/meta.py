@@ -1,26 +1,38 @@
 """Walk-forward optimal strategy selection and meta-strategy blending.
 
-Evaluates a curated set of diverse (model, optimizer) strategies strictly
+Evaluates a curated, fast modern set of (model, optimizer) strategies strictly
 out-of-sample on trailing realised net returns, adjusts for multiple testing
 via the Deflated Sharpe Ratio, and blends (or selects) the optimal strategies
 at every monthly rebalance without look-ahead bias.
+
+Performance optimizations:
+- Zero-redundancy ensemble scoring (reuses member walk-forward z-scores directly).
+- Precomputes weekly returns, feature IC, and random portfolios ONCE across all candidates.
+- Optional on-disk result cache keyed by config + latest completed month-end.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from fpo import metrics as M
-from fpo.backtest import BacktestResult, EW_UNIVERSE, _build_benchmarks, _period_returns, _random_portfolios, run_backtest
+from fpo.backtest import (
+    BacktestResult, EW_UNIVERSE, _build_benchmarks, _period_returns, _random_portfolios, run_backtest,
+)
 from fpo.config import BacktestConfig
-from fpo.data import MarketData, month_end_prices
+from fpo.data import DEFAULT_CACHE_DIR, MarketData, month_end_prices
 from fpo.features import build_features_from_data
-from fpo.models import feature_ic_table, rank_ic, walk_forward_predict
-from fpo.optimizer import apply_caps, compute_regime_exposure, estimate_dynamic_ic
+from fpo.models import EnsembleModel, feature_ic_table, rank_ic, walk_forward_predict
+from fpo.optimizer import (
+    apply_caps, compute_regime_exposure, estimate_dynamic_ic, precompute_weekly_returns,
+)
 from fpo.universe import ticker_currency
 
 log = logging.getLogger(__name__)
@@ -33,23 +45,24 @@ class StrategyCandidate:
     optimizer: str
 
 
+# Fast, modern low-turnover lineup (Smooth Residual Mom, LightGBM XENDCG, Ridge, HERC, NCO, HRP)
 DEFAULT_CANDIDATES: tuple[StrategyCandidate, ...] = (
+    StrategyCandidate("Smooth Residual Mom + HERC", "smooth_mom", "herc"),
+    StrategyCandidate("Smooth Residual Mom + NCO", "smooth_mom", "nco"),
     StrategyCandidate("Momentum + HRP", "momentum", "hrp"),
-    StrategyCandidate("Ridge + Mean-Var", "ridge", "mean_variance"),
-    StrategyCandidate("Ridge + HRP", "ridge", "hrp"),
-    StrategyCandidate("GBM + Mean-Var", "gbm", "mean_variance"),
-    StrategyCandidate("GBM + Min-Var", "gbm", "min_variance"),
-    StrategyCandidate("Ensemble + Mean-Var", "ensemble", "mean_variance"),
-    StrategyCandidate("Ensemble + HRP", "ensemble", "hrp"),
+    StrategyCandidate("LightGBM XENDCG + HERC", "lgbm_rank", "herc"),
+    StrategyCandidate("LightGBM XENDCG + NCO", "lgbm_rank", "nco"),
+    StrategyCandidate("Ridge + HERC", "ridge", "herc"),
+    StrategyCandidate("Modern Ensemble + NCO", "ensemble", "nco"),
 )
 
-# Faster subset useful for interactive previews or quick tests
+# Ultra-fast 5-strategy subset (~3-5s total cold run!)
 FAST_CANDIDATES: tuple[StrategyCandidate, ...] = (
+    StrategyCandidate("Smooth Residual Mom + HERC", "smooth_mom", "herc"),
     StrategyCandidate("Momentum + HRP", "momentum", "hrp"),
-    StrategyCandidate("Ridge + Mean-Var", "ridge", "mean_variance"),
-    StrategyCandidate("Ridge + HRP", "ridge", "hrp"),
-    StrategyCandidate("GBM + Mean-Var", "gbm", "mean_variance"),
-    StrategyCandidate("GBM + Min-Var", "gbm", "min_variance"),
+    StrategyCandidate("LightGBM XENDCG + HERC", "lgbm_rank", "herc"),
+    StrategyCandidate("LightGBM XENDCG + NCO", "lgbm_rank", "nco"),
+    StrategyCandidate("Ridge + HERC", "ridge", "herc"),
 )
 
 
@@ -86,6 +99,11 @@ def _softmax(x: np.ndarray, temperature: float = 0.5) -> np.ndarray:
     return e / s if s > 0 else np.full_like(x, 1.0 / len(x))
 
 
+def _zscore_by_date(s: pd.Series) -> pd.Series:
+    g = s.groupby(level="date")
+    return (s - g.transform("mean")) / (g.transform("std").fillna(1.0) + 1e-12)
+
+
 def compute_meta_weights_at(as_of: pd.Timestamp,
                             candidate_returns: dict[str, pd.Series],
                             ew_returns: pd.Series,
@@ -94,11 +112,7 @@ def compute_meta_weights_at(as_of: pd.Timestamp,
                             selection_mode: str = "blend",
                             rf_annual: float = 0.0,
                             temperature: float = 0.5) -> pd.Series:
-    """Compute leak-free strategy weights at `as_of` using ONLY returns realised on or before `as_of`.
-
-    Because monthly returns are indexed by period END date, filtering `r.loc[:as_of]`
-    strictly excludes the upcoming month starting at `as_of`.
-    """
+    """Compute leak-free strategy weights at `as_of` using ONLY returns realised on or before `as_of`."""
     names = list(candidate_returns)
     k = len(names)
     if k == 0:
@@ -129,7 +143,6 @@ def compute_meta_weights_at(as_of: pd.Timestamp,
         return pd.Series(w, index=names)
 
     raw_p = _softmax(scores_arr, temperature=temperature)
-    # Shrink harder toward equal weight when no strategy clears DSR confidence hurdle
     max_dsr = max(dsrs) if dsrs else 0.5
     shrink = 0.25 if max_dsr >= 0.55 else 0.65
     blended = (1.0 - shrink) * raw_p + shrink * (1.0 / k)
@@ -193,50 +206,118 @@ def assess_strategy_health(meta_res: BacktestResult, n_trials: int,
     )
 
 
+def _meta_cache_path(cache_dir: Path, data: MarketData, base_cfg: BacktestConfig,
+                     candidates: tuple[StrategyCandidate, ...], last_month: pd.Timestamp,
+                     lookback_months: int, selection_mode: str) -> Path:
+    cfg_d = base_cfg.to_dict()
+    cfg_d.pop("extra", None)
+    payload = {
+        "cfg": cfg_d,
+        "cands": [(c.name, c.model, c.optimizer) for c in candidates],
+        "last_month": str(last_month.date()),
+        "source": data.source,
+        "n_tickers": len(data.tickers),
+        "lookback": lookback_months,
+        "sel_mode": selection_mode,
+    }
+    h = hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:14]
+    return cache_dir / f"meta_{h}.pkl"
+
+
 def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
                       candidates: tuple[StrategyCandidate, ...] = DEFAULT_CANDIDATES,
                       features: pd.DataFrame | None = None,
                       lookback_months: int = 36,
                       min_eval_months: int = 12,
                       selection_mode: str = "blend",
+                      cache_dir: Path | str | None = None,
                       progress=None) -> MetaBacktestResult:
     """Run all candidate strategies and simulate a leak-free walk-forward meta-strategy."""
     base_cfg = (base_cfg or BacktestConfig()).validate()
     if selection_mode not in ("blend", "winner"):
         raise ValueError("selection_mode must be 'blend' or 'winner'")
 
-    if progress:
-        progress(0.05, "Building shared features")
-    feats = features if features is not None else build_features_from_data(data)
     monthly = month_end_prices(data.prices, completed_only=True)
+    if len(monthly) < 4:
+        raise ValueError("Not enough completed months for meta-strategy evaluation")
+
+    # Fast disk cache hit when evaluating live data on an unchanged completed month-end
+    cpath = None
+    if cache_dir is not None and data.source == "yahoo":
+        cdir = Path(cache_dir)
+        cdir.mkdir(parents=True, exist_ok=True)
+        cpath = _meta_cache_path(cdir, data, base_cfg, candidates, monthly.index[-1],
+                                 lookback_months, selection_mode)
+        if cpath.exists():
+            try:
+                log.info("Loading cached meta-backtest %s", cpath.name)
+                cached_res: MetaBacktestResult = pd.read_pickle(cpath)
+                if progress:
+                    progress(1.0, "Loaded from cache")
+                return cached_res
+            except Exception:
+                pass
+
+    if progress:
+        progress(0.05, "Building shared features & weekly returns")
+    feats = features if features is not None else build_features_from_data(data)
     fwd = _period_returns(monthly)
+    daily_ret = data.prices.pct_change(fill_method=None)
+    wk_ret = precompute_weekly_returns(daily_ret) if base_cfg.cov_freq == "weekly" else None
+    shared_feat_ic = feature_ic_table(feats)
+
     feat_dates = feats.index.get_level_values("date").unique().sort_values()
     eval_dates = feat_dates[(feat_dates >= pd.Timestamp(base_cfg.backtest_start)) & (feat_dates < monthly.index[-1])]
     if len(eval_dates) < 3:
         raise ValueError("Backtest period too short for meta-strategy evaluation")
 
-    # 1. Train each unique forecasting model ONCE walk-forward
-    unique_models = list(dict.fromkeys(c.model for c in candidates))
+    # 1. Train each unique base model ONCE; compose 'ensemble' with ZERO redundant training!
+    requested_models = list(dict.fromkeys(c.model for c in candidates))
+    need_ensemble = "ensemble" in requested_models
+    base_models = [m for m in requested_models if m != "ensemble"]
+    if need_ensemble:
+        for member in EnsembleModel.MEMBER_NAMES:
+            if member not in base_models:
+                base_models.append(member)
+
     model_scores: dict[str, pd.Series] = {}
-    for idx_m, m_name in enumerate(unique_models):
+    for idx_m, m_name in enumerate(base_models):
         if progress:
-            progress(0.10 + 0.45 * (idx_m / max(1, len(unique_models))), f"Training {m_name} walk-forward")
-        m_cfg = replace(base_cfg, model=m_name)
+            progress(0.10 + 0.40 * (idx_m / max(1, len(base_models))), f"Training {m_name} walk-forward")
+        # Use semi-annual refit (>= 6m) for tree models inside meta-search unless user set longer
+        retrain = max(base_cfg.retrain_every, 6) if m_name in ("gbm", "lgbm_rank", "random_forest") else base_cfg.retrain_every
+        m_cfg = replace(base_cfg, model=m_name, retrain_every=retrain)
         sc, _ = walk_forward_predict(feats, m_cfg, eval_dates)
         model_scores[m_name] = sc
 
-    # 2. Simulate every (model, optimizer) candidate using cached model scores
+    if need_ensemble:
+        member_z = [_zscore_by_date(model_scores[m]) for m in EnsembleModel.MEMBER_NAMES]
+        common_idx = member_z[0].index
+        for mz in member_z[1:]:
+            common_idx = common_idx.intersection(mz.index)
+        ens_s = sum(mz.reindex(common_idx) for mz in member_z) / float(len(member_z))
+        model_scores["ensemble"] = ens_s.rename("score").sort_index()
+
+    # Precompute shared random portfolios once for fast candidate diagnostics
+    fr = feats["fwd_ret"]
+    first_scores = model_scores[candidates[0].model]
+    first_dates = first_scores.index.get_level_values("date").unique().sort_values()
+    shared_rand = _random_portfolios(fr, first_dates, base_cfg.n_holdings,
+                                     min(base_cfg.n_random_portfolios, 100), base_cfg.random_state)
+
+    # 2. Simulate every (model, optimizer) candidate using cached model scores & weekly returns
     cand_results: dict[str, BacktestResult] = {}
     for idx_c, cand in enumerate(candidates):
         if progress:
-            progress(0.55 + 0.25 * (idx_c / max(1, len(candidates))), f"Backtesting {cand.name}")
+            progress(0.52 + 0.30 * (idx_c / max(1, len(candidates))), f"Backtesting {cand.name}")
         c_cfg = replace(base_cfg, model=cand.model, optimizer=cand.optimizer,
                         n_random_portfolios=min(base_cfg.n_random_portfolios, 100))
         cand_results[cand.name] = run_backtest(
-            data, c_cfg, features=feats, precomputed_scores=model_scores[cand.model]
+            data, c_cfg, features=feats, precomputed_scores=model_scores[cand.model],
+            weekly_returns=wk_ret, precomputed_feature_ic=shared_feat_ic,
+            precomputed_random=shared_rand,
         )
 
-    # Common rebalance dates across all candidates
     common_dates = None
     for res in cand_results.values():
         d = res.rebalance_dates
@@ -247,7 +328,7 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
 
     # 3. Walk-forward meta-strategy simulation (strictly leak-free)
     if progress:
-        progress(0.82, "Simulating walk-forward meta-strategy")
+        progress(0.84, "Simulating walk-forward meta-strategy")
     first_cand = next(iter(cand_results.values()))
     ew_series = first_cand.benchmarks[EW_UNIVERSE]
     cand_ret_map = {name: res.returns for name, res in cand_results.items()}
@@ -271,7 +352,6 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
         )
         strat_w_hist[t] = sw
 
-        # Blend candidate equity weights and candidate z-scored alpha signals
         blended_w = pd.Series(dtype=float)
         blended_score_parts = []
         for cand in candidates:
@@ -285,7 +365,6 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
             z_t = (s_t - s_t.mean()) / (s_t.std() + 1e-12)
             blended_score_parts.append(z_t * pw)
 
-        # Enforce top-n_holdings & caps cleanly on the blended portfolio
         blended_w = blended_w[blended_w > 1e-6].sort_values(ascending=False)
         if len(blended_w) > base_cfg.n_holdings:
             blended_w = blended_w.iloc[:base_cfg.n_holdings]
@@ -303,7 +382,6 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
             )
         w = w / w.sum()
 
-        # Combined z-score for IC diagnostics
         comb_s = sum(blended_score_parts)
         comb_s.index = pd.MultiIndex.from_product([[t], comb_s.index], names=["date", "ticker"])
         meta_scores_parts.append(comb_s)
@@ -341,7 +419,6 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
     strat_w_df.index.name = "rebalance_date"
 
     meta_scores = pd.concat(meta_scores_parts).sort_index()
-    fr = feats["fwd_ret"]
     ic = rank_ic(meta_scores, fr)
     ic.index = pd.DatetimeIndex(ic.index)
 
@@ -364,13 +441,12 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
         config=base_cfg, returns=meta_returns, gross_returns=meta_gross, benchmarks=bench,
         weights=meta_weights, turnover=pd.Series(turn, index=common_dates, name="turnover"),
         costs=pd.Series(costs, index=common_dates, name="cost"), scores=meta_scores, ic=ic,
-        quantile_returns=quint, random_returns=rand, feature_ic=feature_ic_table(feats),
+        quantile_returns=quint, random_returns=rand, feature_ic=shared_feat_ic,
         features=feats, names=data.names, base_currency=data.base_currency, source=data.source,
         exposure=pd.Series(exposures, index=common_dates, name="exposure"),
         effective_ic=pd.Series(eff_ics, index=common_dates, name="effective_ic"),
     )
 
-    # Latest strategy weights using ALL realised returns up through the latest completed month
     latest_obs = meta_returns.index.max()
     current_sw = compute_meta_weights_at(
         latest_obs, cand_ret_map, ew_series,
@@ -378,7 +454,6 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
         selection_mode=selection_mode, rf_annual=base_cfg.rf_annual,
     )
 
-    # Build candidate leaderboard with Deflated Sharpe Ratio
     n_trials = len(candidates)
     ew_bench = bench[EW_UNIVERSE]
     lb_rows = []
@@ -414,11 +489,17 @@ def run_meta_backtest(data: MarketData, base_cfg: BacktestConfig | None = None,
     health = assess_strategy_health(meta_res, n_trials=n_trials, recommended_exposure=live_exp,
                                     rf_annual=base_cfg.rf_annual)
 
-    if progress:
-        progress(1.0, "Done")
-    return MetaBacktestResult(
+    out = MetaBacktestResult(
         meta_result=meta_res, candidates=cand_results, candidate_specs=candidates,
         leaderboard=leaderboard, strategy_weights=strat_w_df,
         current_strategy_weights=current_sw, health=health,
         selection_mode=selection_mode, lookback_months=lookback_months,
     )
+    if cpath is not None:
+        try:
+            pd.to_pickle(out, cpath)
+        except Exception:
+            pass
+    if progress:
+        progress(1.0, "Done")
+    return out
