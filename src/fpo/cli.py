@@ -63,7 +63,7 @@ def _config(a, default_broker: str | None = None) -> BacktestConfig:
         min_order_sek=getattr(a, "min_order_sek", 1500.0),
         no_trade_band=getattr(a, "no_trade_band", 0.015),
         rf_annual=getattr(a, "rf", 0.02),
-        backtest_start=getattr(a, "backtest_start", "2012-01-31"),
+        backtest_start=getattr(a, "backtest_start", None) or "2012-01-31",
     )
 
 

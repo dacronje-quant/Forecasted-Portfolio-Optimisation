@@ -138,9 +138,12 @@ def test_etf_eur_currency_and_tactical_backtest(etf_data):
 def test_cli_tactical_smoke(tmp_path):
     outdir = tmp_path / "tac_out"
     cli_main([
-        "tactical", "--synthetic", "--start", "2016-01-01",
+        "tactical", "--synthetic", "--start", "2010-01-01",
         "--budget", "550000", "--exec-mode", "mutual_fund",
+        "--with-satellite", "150000", "--fast",
         "--out", str(outdir),
     ])
-    assert len(list(outdir.glob("tactical_*.md"))) == 1
+    briefs = list(outdir.glob("tactical_*.md"))
+    assert len(briefs) == 1
+    assert "Active Single-Stock Satellite Sleeve" in briefs[0].read_text(encoding="utf-8")
     assert len(list(outdir.glob("tactical_allocation_*.csv"))) == 1
